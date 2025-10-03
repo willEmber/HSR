@@ -395,11 +395,9 @@ def train(train_loader, model, revealNet, revealNet_2, imp_net, loss_fn, optimiz
         for m, x in zip([loss_meter, loss_hr_meter, loss_hr_meter2, loss_sec_meter, loss_sec_meter2,
                          lfreq1_meter, lfreq2_meter, lperc1_meter, lperc2_meter],
                         [loss, loss_hr, loss_hr_2, loss_sec, loss_sec_2,
-                         (l_freq_1.item() if isinstance(l_freq_1, torch.Tensor) else 0.0),
-                         (l_freq_2.item() if isinstance(l_freq_2, torch.Tensor) else 0.0),
-                         (l_perc_1.item() if isinstance(l_perc_1, torch.Tensor) else 0.0),
-                         (l_perc_2.item() if isinstance(l_perc_2, torch.Tensor) else 0.0)]):
-            m.update(x.item(), lr_1_4.shape[0])
+                         l_freq_1, l_freq_2, l_perc_1, l_perc_2]):
+            val_x = x.item() if isinstance(x, torch.Tensor) else float(x)
+            m.update(val_x, lr_1_4.shape[0])
         # Adjust lr
         if cfg.poly_lr:
             current_lr = poly_learning_rate(cfg.base_lr, current_iter, max_iter, power=cfg.power)
@@ -612,11 +610,9 @@ def validate(val_loader, model, revealNet, revealNet_2, imp_net, loss_fn, epoch,
                               lfreq1_meter, lfreq2_meter, lperc1_meter, lperc2_meter],
                             [loss, loss_hr, loss_sec, psnr_lr, psnr_hr, psnr_lr_2, psnr_hr_2,
                              ssim_lr, ssim_hr, ssim_lr_2, ssim_hr_2,
-                             (l_freq_1.item() if isinstance(l_freq_1, torch.Tensor) else 0.0),
-                             (l_freq_2.item() if isinstance(l_freq_2, torch.Tensor) else 0.0),
-                             (l_perc_1.item() if isinstance(l_perc_1, torch.Tensor) else 0.0),
-                             (l_perc_2.item() if isinstance(l_perc_2, torch.Tensor) else 0.0)]):
-                m.update(x.item(), hr.shape[0])
+                             l_freq_1, l_freq_2, l_perc_1, l_perc_2]):
+                val_x = x.item() if isinstance(x, torch.Tensor) else float(x)
+                m.update(val_x, hr.shape[0])
 
             # Visualize after validation
         if main_process(cfg):
