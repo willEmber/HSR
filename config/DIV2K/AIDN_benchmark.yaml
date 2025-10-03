@@ -13,6 +13,10 @@ DATA:
 
 LOSS:
   loss_lr_weight: 1.0
+  # 低频一致性损失（Haar-DWT，LL子带）权重 λf（仅影响loss计算，不影响推理）
+  lambda_freq: 1.0
+  # 感知损失（VGG16特征）权重 λp（仅影响训练loss）
+  lambda_perc: 0.01
 
 NETWORK:
   base_resolution: 4

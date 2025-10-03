@@ -22,8 +22,10 @@ from base.baseTrainer import poly_learning_rate, reduce_tensor, save_checkpoint,
 from base.utilities import get_parser, get_logger, main_process, AverageMeter
 from models.RevealNet import RevealNet
 from models.imp_subnet_DeepMIH import ImpMapBlock
+from models.modules.Unet_common import DWT
 from models import get_model
 from metrics.loss import *
+from metrics.perceptual import PerceptualLoss
 from metrics import psnr, ssim
 from dataset.torch_bicubic import imresize
 from torch.optim.lr_scheduler import StepLR
@@ -283,10 +285,23 @@ def train(train_loader, model, revealNet, revealNet_2, imp_net, loss_fn, optimiz
     loss_hr_meter2 = AverageMeter()
     loss_sec_meter = AverageMeter()
     loss_sec_meter2 = AverageMeter()
+    lfreq1_meter = AverageMeter()
+    lfreq2_meter = AverageMeter()
+    lperc1_meter = AverageMeter()
+    lperc2_meter = AverageMeter()
     model.train()
     revealNet.train()
     revealNet_2.train()
     imp_net.train()
+    # Haar-DWT for LL subband loss
+    dwt = DWT()
+    lambda_freq = getattr(cfg, 'lambda_freq', 0.0)
+    # Perceptual loss (VGG16 conv3_3)
+    lambda_perc = getattr(cfg, 'lambda_perc', 0.0)
+    perc_crit = None
+    if lambda_perc != 0.0:
+        perc_crit = PerceptualLoss()
+        perc_crit = perc_crit.cuda(cfg.gpu)
 
     end = time.time()
     max_iter = cfg.epochs * len(train_loader)
@@ -337,10 +352,39 @@ def train(train_loader, model, revealNet, revealNet_2, imp_net, loss_fn, optimiz
         loss_sec = loss_fn[1](sec, recovered)
         loss_sec_2 = loss_fn[1](sec_2, recovered_2)
 
+        # Low-frequency consistency (Haar-DWT, LL subband)
+        if lambda_freq != 0.0:
+            ll_stego_1 = dwt(restored_hr).narrow(1, 0, restored_hr.shape[1])
+            ll_cover_1 = dwt(lr_1_2).narrow(1, 0, lr_1_2.shape[1])
+            l_freq_1 = torch.nn.functional.l1_loss(ll_stego_1, ll_cover_1)
+
+            ll_stego_2 = dwt(restored_hr2).narrow(1, 0, restored_hr2.shape[1])
+            ll_cover_2 = dwt(hr).narrow(1, 0, hr.shape[1])
+            l_freq_2 = torch.nn.functional.l1_loss(ll_stego_2, ll_cover_2)
+        else:
+            l_freq_1 = 0.0
+            l_freq_2 = 0.0
+
+        # Perceptual consistency on stego vs. cover for both stages
+        if lambda_perc != 0.0 and perc_crit is not None:
+            l_perc_1 = perc_crit(restored_hr, lr_1_2)
+            l_perc_2 = perc_crit(restored_hr2, hr)
+        else:
+            l_perc_1 = 0.0
+            l_perc_2 = 0.0
+
         loss_dist = loss_fn[1](dist, restored_hr)
         loss_rev_dist = loss_fn[1](rev_dist, sec)
 
-        loss = loss_hr + loss_sec + loss_hr_2 + loss_sec_2 + loss_dist + loss_rev_dist
+        # Stage-wise loss with low-frequency consistency
+        loss_stage_1 = loss_hr + loss_sec \
+                        + (lambda_freq * l_freq_1 if isinstance(l_freq_1, torch.Tensor) else 0.0) \
+                        + (lambda_perc * l_perc_1 if isinstance(l_perc_1, torch.Tensor) else 0.0)
+        loss_stage_2 = loss_hr_2 + loss_sec_2 \
+                        + (lambda_freq * l_freq_2 if isinstance(l_freq_2, torch.Tensor) else 0.0) \
+                        + (lambda_perc * l_perc_2 if isinstance(l_perc_2, torch.Tensor) else 0.0)
+
+        loss = loss_stage_1 + loss_stage_2 + loss_dist + loss_rev_dist
 
         optimizer.zero_grad()
         loss.backward()
@@ -348,8 +392,13 @@ def train(train_loader, model, revealNet, revealNet_2, imp_net, loss_fn, optimiz
 
         batch_time.update(time.time() - end)
         end = time.time()
-        for m, x in zip([loss_meter, loss_hr_meter, loss_hr_meter2, loss_sec_meter, loss_sec_meter2],
-                        [loss, loss_hr, loss_hr_2, loss_sec, loss_sec_2]):
+        for m, x in zip([loss_meter, loss_hr_meter, loss_hr_meter2, loss_sec_meter, loss_sec_meter2,
+                         lfreq1_meter, lfreq2_meter, lperc1_meter, lperc2_meter],
+                        [loss, loss_hr, loss_hr_2, loss_sec, loss_sec_2,
+                         (l_freq_1.item() if isinstance(l_freq_1, torch.Tensor) else 0.0),
+                         (l_freq_2.item() if isinstance(l_freq_2, torch.Tensor) else 0.0),
+                         (l_perc_1.item() if isinstance(l_perc_1, torch.Tensor) else 0.0),
+                         (l_perc_2.item() if isinstance(l_perc_2, torch.Tensor) else 0.0)]):
             m.update(x.item(), lr_1_4.shape[0])
         # Adjust lr
         if cfg.poly_lr:
@@ -401,6 +450,10 @@ def train(train_loader, model, revealNet, revealNet_2, imp_net, loss_fn, optimiz
                         'Loss_sec: {loss_sec_meter.val:.4f} '
                         'Loss_hr2: {loss_hr_meter2.val:.4f} '
                         'Loss_sec2: {loss_sec_meter2.val:.4f} '
+                        'L_freq1: {lfreq1_meter.val:.4f} '
+                        'L_freq2: {lfreq2_meter.val:.4f} '
+                        'L_perc1: {lperc1_meter.val:.4f} '
+                        'L_perc2: {lperc2_meter.val:.4f} '
                         'data_info: {data_result_info} '
                         .format(epoch + 1, cfg.epochs, i + 1, len(train_loader),
                                 batch_time=batch_time, data_time=data_time,
@@ -410,14 +463,26 @@ def train(train_loader, model, revealNet, revealNet_2, imp_net, loss_fn, optimiz
                                 loss_sec_meter=loss_sec_meter,
                                 loss_hr_meter2=loss_hr_meter2,
                                 loss_sec_meter2=loss_sec_meter2,
+                                lfreq1_meter=lfreq1_meter,
+                                lfreq2_meter=lfreq2_meter,
+                                lperc1_meter=lperc1_meter,
+                                lperc2_meter=lperc2_meter,
                                 data_result_info=data_result_info
                                 ))
-            for m, s in zip([loss_meter, loss_hr_meter, loss_sec_meter, loss_hr_meter2, loss_sec_meter2],
+            for m, s in zip([loss_meter, loss_hr_meter, loss_sec_meter, loss_hr_meter2, loss_sec_meter2,
+                             lfreq1_meter, lfreq2_meter, lperc1_meter, lperc2_meter],
                             ["train_batch/loss", "train_batch/loss_hr", "train_batch/loss_sec", "train_batch/loss_hr2",
-                             "train_batch/loss_sec2"]):
+                             "train_batch/loss_sec2", "train_batch/l_freq1", "train_batch/l_freq2",
+                             "train_batch/l_perc1", "train_batch/l_perc2"]):
                 writer.add_scalar(s, m.val, current_iter)
             writer.add_scalar('learning_rate', current_lr, current_iter)
             writer.add_histogram('train_batch/scale', scale, current_iter)
+    # Epoch-level logging of averages for easier tuning
+    if main_process(cfg):
+        writer.add_scalar('train/l_freq1', lfreq1_meter.avg, epoch + 1)
+        writer.add_scalar('train/l_freq2', lfreq2_meter.avg, epoch + 1)
+        writer.add_scalar('train/l_perc1', lperc1_meter.avg, epoch + 1)
+        writer.add_scalar('train/l_perc2', lperc2_meter.avg, epoch + 1)
     return loss_meter.avg, loss_hr_meter.avg, loss_sec_meter.avg
 
 
@@ -426,6 +491,10 @@ def validate(val_loader, model, revealNet, revealNet_2, imp_net, loss_fn, epoch,
     loss_hr_meter = AverageMeter()
     loss_sec_meter = AverageMeter()
     psnr_meter, ssim_meter = [AverageMeter() for _ in range(4)], [AverageMeter() for _ in range(4)]
+    lfreq1_meter = AverageMeter()
+    lfreq2_meter = AverageMeter()
+    lperc1_meter = AverageMeter()
+    lperc2_meter = AverageMeter()
 
     psnr_calculator, ssim_calculator = psnr.PSNR(), ssim.SSIM()
 
@@ -433,6 +502,13 @@ def validate(val_loader, model, revealNet, revealNet_2, imp_net, loss_fn, epoch,
     revealNet.eval()
     revealNet_2.eval()
     imp_net.eval()
+    dwt = DWT()
+    lambda_freq = getattr(cfg, 'lambda_freq', 0.0)
+    lambda_perc = getattr(cfg, 'lambda_perc', 0.0)
+    perc_crit = None
+    if lambda_perc != 0.0:
+        perc_crit = PerceptualLoss()
+        perc_crit = perc_crit.cuda(cfg.gpu)
     with torch.no_grad():
         for step, batch in enumerate(val_loader):
             scale = cfg.scale  # 4
@@ -470,7 +546,35 @@ def validate(val_loader, model, revealNet, revealNet_2, imp_net, loss_fn, epoch,
             loss_dist = loss_fn[1](dist, restored_hr)
             loss_rev_dist = loss_fn[1](rev_dist, sec)
 
-            loss = loss_hr + loss_sec + loss_hr_2 + loss_sec_2 + loss_dist + loss_rev_dist
+            # Low-frequency consistency (Haar-DWT, LL subband)
+            if lambda_freq != 0.0:
+                ll_stego_1 = dwt(restored_hr).narrow(1, 0, restored_hr.shape[1])
+                ll_cover_1 = dwt(lr_1_2).narrow(1, 0, lr_1_2.shape[1])
+                l_freq_1 = torch.nn.functional.l1_loss(ll_stego_1, ll_cover_1)
+
+                ll_stego_2 = dwt(restored_hr2).narrow(1, 0, restored_hr2.shape[1])
+                ll_cover_2 = dwt(hr).narrow(1, 0, hr.shape[1])
+                l_freq_2 = torch.nn.functional.l1_loss(ll_stego_2, ll_cover_2)
+            else:
+                l_freq_1 = 0.0
+                l_freq_2 = 0.0
+
+            # Perceptual consistency on stego vs. cover for both stages
+            if lambda_perc != 0.0 and perc_crit is not None:
+                l_perc_1 = perc_crit(restored_hr, lr_1_2)
+                l_perc_2 = perc_crit(restored_hr2, hr)
+            else:
+                l_perc_1 = 0.0
+                l_perc_2 = 0.0
+
+            loss_stage_1 = loss_hr + loss_sec \
+                            + (lambda_freq * l_freq_1 if isinstance(l_freq_1, torch.Tensor) else 0.0) \
+                            + (lambda_perc * l_perc_1 if isinstance(l_perc_1, torch.Tensor) else 0.0)
+            loss_stage_2 = loss_hr_2 + loss_sec_2 \
+                            + (lambda_freq * l_freq_2 if isinstance(l_freq_2, torch.Tensor) else 0.0) \
+                            + (lambda_perc * l_perc_2 if isinstance(l_perc_2, torch.Tensor) else 0.0)
+
+            loss = loss_stage_1 + loss_stage_2 + loss_dist + loss_rev_dist
 
             psnr_lr, psnr_hr = \
                 psnr_calculator(recovered, sec), psnr_calculator(restored_hr, lr_1_2)
@@ -504,9 +608,14 @@ def validate(val_loader, model, revealNet, revealNet_2, imp_net, loss_fn, epoch,
                 ssim_hr_2 = reduce_tensor(ssim_hr_2, cfg)
 
 
-            for m, x in zip([loss_meter, loss_hr_meter, loss_sec_meter, *psnr_meter, *ssim_meter],
+            for m, x in zip([loss_meter, loss_hr_meter, loss_sec_meter, *psnr_meter, *ssim_meter,
+                              lfreq1_meter, lfreq2_meter, lperc1_meter, lperc2_meter],
                             [loss, loss_hr, loss_sec, psnr_lr, psnr_hr, psnr_lr_2, psnr_hr_2,
-                             ssim_lr, ssim_hr, ssim_lr_2, ssim_hr_2]):
+                             ssim_lr, ssim_hr, ssim_lr_2, ssim_hr_2,
+                             (l_freq_1.item() if isinstance(l_freq_1, torch.Tensor) else 0.0),
+                             (l_freq_2.item() if isinstance(l_freq_2, torch.Tensor) else 0.0),
+                             (l_perc_1.item() if isinstance(l_perc_1, torch.Tensor) else 0.0),
+                             (l_perc_2.item() if isinstance(l_perc_2, torch.Tensor) else 0.0)]):
                 m.update(x.item(), hr.shape[0])
 
             # Visualize after validation
@@ -515,6 +624,11 @@ def validate(val_loader, model, revealNet, revealNet_2, imp_net, loss_fn, epoch,
             sample_hr = torchvision.utils.make_grid(restored_hr.clamp(0.0, 1.0))
             writer.add_image('sample_results/res_lr', sample_lr, epoch + 1)
             writer.add_image('sample_results/res_hr', sample_hr, epoch + 1)
+            # Log validation averages for freq/perceptual
+            writer.add_scalar('val/l_freq1', lfreq1_meter.avg, epoch + 1)
+            writer.add_scalar('val/l_freq2', lfreq2_meter.avg, epoch + 1)
+            writer.add_scalar('val/l_perc1', lperc1_meter.avg, epoch + 1)
+            writer.add_scalar('val/l_perc2', lperc2_meter.avg, epoch + 1)
 
     return loss_meter.avg, loss_hr_meter.avg, loss_sec_meter.avg, [m.avg for m in psnr_meter], [m.avg for m in ssim_meter]
 
