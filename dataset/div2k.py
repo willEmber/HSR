@@ -22,7 +22,35 @@ class DIV2K(Dataset):
     def __init__(self, data_list=None, training=False, cfg=None):
         super(DIV2K, self).__init__()
         self.cfg = cfg
-        self.imgs = list_from_file(data_list, prefix=cfg.data_root + '/')
+        # Load list entries first without prefix, then resolve to absolute paths.
+        # This avoids issues when the list file contains absolute paths or blank lines.
+        raw_list = list_from_file(data_list)
+        resolved: list[str] = []
+        for entry in raw_list:
+            if entry is None:
+                continue
+            p = str(entry).strip()
+            if not p:
+                # Skip blank lines
+                continue
+            # If relative path, join with data_root; otherwise keep absolute
+            if not os.path.isabs(p):
+                p = os.path.join(cfg.data_root, p)
+            # Filter out directories or non-existent paths early to prevent IsADirectoryError
+            if os.path.isdir(p):
+                # Silently skip directories; list files should only contain image files
+                continue
+            if not os.path.isfile(p):
+                # Skip invalid entries
+                continue
+            resolved.append(p)
+
+        if len(resolved) == 0:
+            raise FileNotFoundError(
+                f"No valid image files resolved from list '{data_list}'. "
+                f"Please check DATA.data_root='{cfg.data_root}' and list file contents.")
+
+        self.imgs = resolved
         assert self.cfg.patch_size % self.cfg.base_resolution == 0, "Patch size must base resolution"
         self.training = training
 

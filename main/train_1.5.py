@@ -188,10 +188,16 @@ def main_worker(gpu, ngpus_per_node, args):
     # ####################### Data Loader ####################### #
     if cfg.data_name == 'DIV2K':
         from dataset.div2k import DIV2K
-        train_data = DIV2K(data_list=os.path.join(cfg.data_root, 'list/train.txt'), training=True,
-                           cfg=cfg)
-        val_data = DIV2K(data_list=os.path.join(cfg.data_root, 'list/valid.txt'), training=False,
-                         cfg=cfg) if cfg.evaluate else None
+        # Prefer explicit list files from config when provided; fallback to default under data_root/list
+        train_list = getattr(cfg, 'train_set', None)
+        val_list = getattr(cfg, 'val_set', None)
+        if not train_list:
+            train_list = os.path.join(cfg.data_root, 'list/train.txt')
+        if cfg.evaluate and not val_list:
+            val_list = os.path.join(cfg.data_root, 'list/valid.txt')
+
+        train_data = DIV2K(data_list=train_list, training=True, cfg=cfg)
+        val_data = DIV2K(data_list=val_list, training=False, cfg=cfg) if cfg.evaluate else None
 
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_data) if cfg.distributed else None
         train_loader = torch.utils.data.DataLoader(train_data, batch_size=cfg.batch_size,
