@@ -58,7 +58,7 @@ TRAIN:
   patience: 3
   threshold: 0.00025
   poly_lr: False
-  epochs: 300 # 300
+  epochs: 800 # 300
   start_epoch: 0
   power: 0.9
   momentum: 0.9
