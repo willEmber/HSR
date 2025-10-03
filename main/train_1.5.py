@@ -190,7 +190,7 @@ def main_worker(gpu, ngpus_per_node, args):
         from dataset.div2k import DIV2K
         train_data = DIV2K(data_list=os.path.join(cfg.data_root, 'list/train.txt'), training=True,
                            cfg=cfg)
-        val_data = DIV2K(data_list=os.path.join(cfg.data_root, 'list/val.txt'), training=False,
+        val_data = DIV2K(data_list=os.path.join(cfg.data_root, 'list/valid.txt'), training=False,
                          cfg=cfg) if cfg.evaluate else None
 
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_data) if cfg.distributed else None
