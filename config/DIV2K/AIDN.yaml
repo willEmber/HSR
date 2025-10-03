@@ -1,8 +1,8 @@
 DATA:
   data_name: DIV2K
-  data_root: /opt/data/xiaobin/MyDatasets/DIV2K/
-  train_set: /opt/data/xiaobin/MyDatasets/DIV2K/list/train.txt
-  val_set: /opt/data/xiaobin/MyDatasets/DIV2K/list/val.txt
+  data_root: /data/project/dataset/DIV2K/DIV2K
+  train_set: /data/project/dataset/DIV2K/DIV2K/train.txt
+  val_set: /data/project/dataset/DIV2K/DIV2K/valid.txt
   loop: 1
   # todo 记得每次要调整todo内容 ==> patch_size
   patch_size: 192
@@ -15,7 +15,7 @@ DATA:
 LOSS:
   loss_lr_weight: 1.0
   # todo 记得每次要调整todo内容 ==> lada
-  lada: 1.0  # 用于提高sr图像的质量的超参数
+  lada: 1.0 # 用于提高sr图像的质量的超参数
 
 NETWORK:
   base_resolution: 4
@@ -24,9 +24,9 @@ NETWORK:
   down_sampler: sampleB
   n_resblocks: 16
   n_feats: 64
-  fixed_scale: False  # old: False
+  fixed_scale: False # old: False
   scale: 2
-  rescale:  # not used
+  rescale: # not used
   n_colors: 3
   res_scale: 1
   quantization: True
@@ -37,15 +37,14 @@ NETWORK:
   jpeg: False
   # jpeg_type: DiffJPEG
 
-
 TRAIN:
   use_sgd: False
-  sync_bn: True  # adopt sync_bn or not
+  sync_bn: True # adopt sync_bn or not
   train_gpu: [0]
-  workers: 16  # data loader workers
+  workers: 16 # data loader workers
   # todo 记得每次要调整todo内容 ==> batch_size  288: 5  432 : 2
-  batch_size: 10  # batch size for training
-  batch_size_val: 16  # batch size for validation during training, memory and speed tradeoff
+  batch_size: 10 # batch size for training
+  batch_size_val: 16 # batch size for validation during training, memory and speed tradeoff
   base_lr: 0.0001
   StepLR: True
   step_size: 60
@@ -66,12 +65,12 @@ TRAIN:
   save_path:
   weight: LOG/DIV2K/pre-train/AIDN_pretrainedx4.pth.tar
   resume:
-  evaluate: True  # evaluate on validation set, extra gpu memory needed and small batch_size_val is recommend
+  evaluate: True # evaluate on validation set, extra gpu memory needed and small batch_size_val is recommend
   eval_freq: 10
 
 Distributed:
   dist_url: tcp://127.0.0.1:6799
-  dist_backend: 'nccl'
+  dist_backend: "nccl"
   multiprocessing_distributed: True
   world_size: 1
   rank: 0
@@ -79,7 +78,7 @@ Distributed:
 TEST:
   exp_name: AIDN
   test_root: ../Data/
-#  test_dataset: Set5+Set14+BSDS100+urban100
+  #  test_dataset: Set5+Set14+BSDS100+urban100
   test_dataset: Set5
   test_scale: 1.5+2.5+3.5
   save: True
