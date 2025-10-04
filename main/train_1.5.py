@@ -199,10 +199,18 @@ def main_worker(gpu, ngpus_per_node, args):
         # Prefer explicit list files from config when provided; fallback to default under data_root/list
         train_list = getattr(cfg, 'train_set', None)
         val_list = getattr(cfg, 'val_set', None)
-        if not train_list:
+        # Resolve list file paths: if relative, treat as relative to data_root
+        if train_list:
+            if not os.path.isabs(train_list):
+                train_list = os.path.join(cfg.data_root, train_list)
+        else:
             train_list = os.path.join(cfg.data_root, 'list/train.txt')
-        if cfg.evaluate and not val_list:
-            val_list = os.path.join(cfg.data_root, 'list/valid.txt')
+        if cfg.evaluate:
+            if val_list:
+                if not os.path.isabs(val_list):
+                    val_list = os.path.join(cfg.data_root, val_list)
+            else:
+                val_list = os.path.join(cfg.data_root, 'list/valid.txt')
 
         train_data = DIV2K(data_list=train_list, training=True, cfg=cfg)
         val_data = DIV2K(data_list=val_list, training=False, cfg=cfg) if cfg.evaluate else None
