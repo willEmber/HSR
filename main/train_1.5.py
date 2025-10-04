@@ -369,13 +369,17 @@ def train(train_loader, model, revealNet, revealNet_2, imp_net, loss_fn, optimiz
             (lambda_imp * loss_imp).backward()
             optimizer_imp.step()
 
-            # For logging consistency, set other losses to zeros
+            # For metrics consistency in warm-start, decode with frozen reveal nets (no grad)
             restored_hr = sr_1_tmp.detach()
-            restored_hr2 = restored_hr.detach()  # placeholder
-            recovered = restored_hr.detach()
-            recovered_2 = restored_hr.detach()
-            dist = restored_hr.detach()
-            rev_dist = recovered
+            with torch.no_grad():
+                recovered = revealNet(restored_hr, scale)
+                # Synthesize a stage-2 HR by upsampling sr_1 to HR size for logging
+                restored_hr2 = nn.functional.interpolate(restored_hr, size=hr.shape[-2:], mode="bilinear", align_corners=False)
+                recovered_2 = revealNet_2(restored_hr2, scale)
+                # For dist consistency
+                _, _, w, h = restored_hr.shape
+                dist = nn.functional.interpolate(restored_hr2, [w, h], mode="bilinear", align_corners=False)
+                rev_dist = revealNet(dist, scale)
 
             loss_hr = torch.tensor(0.0, device=hr.device)
             loss_hr_2 = torch.tensor(0.0, device=hr.device)
