@@ -44,8 +44,9 @@ weights = [i / weights_np_sum for i in weights]
 
 def main():
     args = get_parser()
-    # os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(str(x) for x in args.train_gpu)
-    os.environ["CUDA_VISIBLE_DEVICES"] = '2'
+    # Respect external CUDA selection; fallback to config if unset
+    if not os.environ.get("CUDA_VISIBLE_DEVICES"):
+        os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(str(x) for x in args.train_gpu)
 
     cudnn.benchmark = True
 
