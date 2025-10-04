@@ -20,6 +20,8 @@ LOSS:
   lambda_freq: 1.0
   # 感知损失（VGG16特征）权重 λp
   lambda_perc: 0.01
+  # 重要性图预热阶段损失（仅预热阶段启用）权重 λimp
+  lambda_imp: 1.0
 
 NETWORK:
   base_resolution: 4
@@ -71,6 +73,8 @@ TRAIN:
   resume:
   evaluate: True # evaluate on validation set, extra gpu memory needed and small batch_size_val is recommend
   eval_freq: 20
+  # 仅前若干轮仅训练IM，拟合 (x_stego_(t−1) − x_cover)
+  warmup_imp_epochs: 5
 
 Distributed:
   dist_url: tcp://127.0.0.1:6799

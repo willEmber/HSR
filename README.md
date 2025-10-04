@@ -101,6 +101,9 @@ python verify_fix.py --input path/to/stegoN.png --down 1-2 --out runs/...
 - **DEN（Distribution-Extraction Network）**：负责分发/解码。支持 **单层**（直接从对应轮次 stego 恢复）与 **跨层**（先将高层 stego 下采样到目标层，再恢复）。
 - **损失**：`Lh`（隐写/超分的容器保真）、`Lr`（秘密恢复）、`Ldist`（跨层分发/解码约束）、`Limp`（重要性图预训练/稳定）。
 
+Warm-up IM（预热阶段）
+- 仅前若干轮训练 IM，使 `x_imp ≈ x_stego_(t−1) − x_cover`，通过 `TRAIN.warmup_imp_epochs` 控制轮数、`LOSS.lambda_imp` 控制权重；联合阶段不再显式使用 `Limp`，避免 IM 退化为“简单残差”。
+
 ------
 
 ## 📊 评价指标与期望表现

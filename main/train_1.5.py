@@ -141,9 +141,12 @@ def main_worker(gpu, ngpus_per_node, args):
             itertools.chain(model.parameters(), revealNet.parameters(), revealNet_2.parameters(), imp_net.parameters()), lr=cfg.base_lr,
             momentum=cfg.momentum,
             weight_decay=cfg.weight_decay)
+        optimizer_imp = torch.optim.SGD(imp_net.parameters(), lr=cfg.base_lr,
+                                        momentum=cfg.momentum, weight_decay=cfg.weight_decay)
     else:
         optimizer = torch.optim.Adam(
             itertools.chain(model.parameters(), revealNet.parameters(), revealNet_2.parameters(), imp_net.parameters()), lr=cfg.base_lr)
+        optimizer_imp = torch.optim.Adam(imp_net.parameters(), lr=cfg.base_lr)
 
     if cfg.weight:
         if os.path.isfile(cfg.weight):
@@ -163,8 +166,10 @@ def main_worker(gpu, ngpus_per_node, args):
                 logger.info("=> no weight found at '{}'".format(cfg.weight))
     if cfg.StepLR:
         scheduler = StepLR(optimizer, step_size=cfg.step_size, gamma=cfg.gamma)
+        scheduler_imp = StepLR(optimizer_imp, step_size=cfg.step_size, gamma=cfg.gamma)
     else:
         scheduler = None
+        scheduler_imp = None
     if cfg.resume:
         if os.path.isfile(cfg.resume):
             if main_process(cfg):
@@ -223,11 +228,13 @@ def main_worker(gpu, ngpus_per_node, args):
             if cfg.evaluate:
                 val_sampler.set_epoch(epoch)
 
-        loss_train, hr_loss, _ = train(train_loader, model, revealNet, revealNet_2, imp_net, loss, optimizer, epoch, cfg)
+        loss_train, hr_loss, _ = train(train_loader, model, revealNet, revealNet_2, imp_net, loss, optimizer, optimizer_imp, epoch, cfg)
         epoch_log = epoch + 1
         # # Adaptive LR
         if cfg.StepLR:
             scheduler.step()
+            if scheduler_imp is not None:
+                scheduler_imp.step()
         if main_process(cfg):
             logger.info('TRAIN Epoch: {} '
                         'loss_train: {} '
@@ -277,7 +284,7 @@ def main_worker(gpu, ngpus_per_node, args):
                             )
 
 
-def train(train_loader, model, revealNet, revealNet_2, imp_net, loss_fn, optimizer, epoch, cfg):
+def train(train_loader, model, revealNet, revealNet_2, imp_net, loss_fn, optimizer, optimizer_imp, epoch, cfg):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     loss_meter = AverageMeter()
@@ -289,6 +296,7 @@ def train(train_loader, model, revealNet, revealNet_2, imp_net, loss_fn, optimiz
     lfreq2_meter = AverageMeter()
     lperc1_meter = AverageMeter()
     lperc2_meter = AverageMeter()
+    limp_meter = AverageMeter()
     model.train()
     revealNet.train()
     revealNet_2.train()
@@ -298,6 +306,9 @@ def train(train_loader, model, revealNet, revealNet_2, imp_net, loss_fn, optimiz
     lambda_freq = getattr(cfg, 'lambda_freq', 0.0)
     # Perceptual loss (VGG16 conv3_3)
     lambda_perc = getattr(cfg, 'lambda_perc', 0.0)
+    # Warm-start for IM
+    warmup_imp_epochs = int(getattr(cfg, 'warmup_imp_epochs', 0))
+    lambda_imp = float(getattr(cfg, 'lambda_imp', 1.0))
     perc_crit = None
     if lambda_perc != 0.0:
         perc_crit = PerceptualLoss()
@@ -332,79 +343,147 @@ def train(train_loader, model, revealNet, revealNet_2, imp_net, loss_fn, optimiz
         lr_1_2 = imresize(hr, scale=1.0 / scale).detach()
 
         sec = imresize(sec_gt, scale=1.0 / (scale * scale)).detach()
-        sec_imp = imresize(sec_gt, scale=1.0 / scale).detach()
         sec_2 = imresize(sec_gt2, scale=1.0 / scale).detach()
 
-        imp_map = imp_net(lr_1_2, sec_imp, sec_2)
-        restored_hr, restored_hr2 = model(lr_1_4, sec, sec_2, imp_map, scale)
-        recovered = revealNet(restored_hr, scale)
-        recovered_2 = revealNet_2(restored_hr2, scale)
+        # Warm-start phase: only train IM to fit residual (sr_1 - cover)
+        if epoch < warmup_imp_epochs:
+            # Freeze main networks during warmup
+            for p in model.parameters():
+                p.requires_grad = False
+            for p in revealNet.parameters():
+                p.requires_grad = False
+            for p in revealNet_2.parameters():
+                p.requires_grad = False
+            for p in imp_net.parameters():
+                p.requires_grad = True
 
-        _, _, w, h = restored_hr.shape
-        dist = nn.functional.interpolate(restored_hr2, [w, h], mode="bilinear")
+            # Get sr_1 with zero imp map just to form target residual
+            zero_imp = torch.zeros_like(lr_1_2)
+            sr_1_tmp, _ = model(lr_1_4, sec, sec_2, zero_imp, scale)
+            # Target residual: stego_(t-1) - cover
+            res_target = (sr_1_tmp.detach() - lr_1_2)
+            imp_map = imp_net(lr_1_2, sec_2, sr_1_tmp.detach())
+            loss_imp = torch.nn.functional.l1_loss(imp_map, res_target)
 
-        rev_dist = revealNet(dist, scale)
+            optimizer_imp.zero_grad()
+            (lambda_imp * loss_imp).backward()
+            optimizer_imp.step()
 
-        # LOSS
-        # loss_lr = loss_fn[0](encoded_lr, lr)  # 0: MSE 1:L1
-        loss_hr = loss_fn[1](restored_hr, lr_1_2)
-        loss_hr_2 = loss_fn[1](restored_hr2, hr)
-        loss_sec = loss_fn[1](sec, recovered)
-        loss_sec_2 = loss_fn[1](sec_2, recovered_2)
+            # For logging consistency, set other losses to zeros
+            restored_hr = sr_1_tmp.detach()
+            restored_hr2 = restored_hr.detach()  # placeholder
+            recovered = restored_hr.detach()
+            recovered_2 = restored_hr.detach()
+            dist = restored_hr.detach()
+            rev_dist = recovered
 
-        # Low-frequency consistency (Haar-DWT, LL subband)
-        if lambda_freq != 0.0:
-            ll_stego_1 = dwt(restored_hr).narrow(1, 0, restored_hr.shape[1])
-            ll_cover_1 = dwt(lr_1_2).narrow(1, 0, lr_1_2.shape[1])
-            l_freq_1 = torch.nn.functional.l1_loss(ll_stego_1, ll_cover_1)
-
-            ll_stego_2 = dwt(restored_hr2).narrow(1, 0, restored_hr2.shape[1])
-            ll_cover_2 = dwt(hr).narrow(1, 0, hr.shape[1])
-            l_freq_2 = torch.nn.functional.l1_loss(ll_stego_2, ll_cover_2)
-        else:
+            loss_hr = torch.tensor(0.0, device=hr.device)
+            loss_hr_2 = torch.tensor(0.0, device=hr.device)
+            loss_sec = torch.tensor(0.0, device=hr.device)
+            loss_sec_2 = torch.tensor(0.0, device=hr.device)
             l_freq_1 = 0.0
             l_freq_2 = 0.0
-
-        # Perceptual consistency on stego vs. cover for both stages
-        if lambda_perc != 0.0 and perc_crit is not None:
-            l_perc_1 = perc_crit(restored_hr, lr_1_2)
-            l_perc_2 = perc_crit(restored_hr2, hr)
-        else:
             l_perc_1 = 0.0
             l_perc_2 = 0.0
+            loss_dist = torch.tensor(0.0, device=hr.device)
+            loss_rev_dist = torch.tensor(0.0, device=hr.device)
+            loss = lambda_imp * loss_imp
+        else:
+            # Joint stage: compute imp_map from (cover, stego_(t-1), secret_t), then train end-to-end
+            for p in model.parameters():
+                p.requires_grad = True
+            for p in revealNet.parameters():
+                p.requires_grad = True
+            for p in revealNet_2.parameters():
+                p.requires_grad = True
+            for p in imp_net.parameters():
+                p.requires_grad = True
 
-        loss_dist = loss_fn[1](dist, restored_hr)
-        loss_rev_dist = loss_fn[1](rev_dist, sec)
+            # First pass to get sr_1 (no IM guidance)
+            zero_imp = torch.zeros_like(lr_1_2)
+            sr_1_tmp, _ = model(lr_1_4, sec, sec_2, zero_imp, scale)
+            # Compute importance map using correct DeepMIH inputs: (cover, secret_t, stego_(t-1))
+            imp_map = imp_net(lr_1_2, sec_2, sr_1_tmp.detach())
+            # Second pass with actual imp_map
+            restored_hr, restored_hr2 = model(lr_1_4, sec, sec_2, imp_map, scale)
+            recovered = revealNet(restored_hr, scale)
+            recovered_2 = revealNet_2(restored_hr2, scale)
 
-        # Stage-wise loss with low-frequency consistency
-        loss_stage_1 = loss_hr + loss_sec \
-                        + (lambda_freq * l_freq_1 if isinstance(l_freq_1, torch.Tensor) else 0.0) \
-                        + (lambda_perc * l_perc_1 if isinstance(l_perc_1, torch.Tensor) else 0.0)
-        loss_stage_2 = loss_hr_2 + loss_sec_2 \
-                        + (lambda_freq * l_freq_2 if isinstance(l_freq_2, torch.Tensor) else 0.0) \
-                        + (lambda_perc * l_perc_2 if isinstance(l_perc_2, torch.Tensor) else 0.0)
+            _, _, w, h = restored_hr.shape
+            dist = nn.functional.interpolate(restored_hr2, [w, h], mode="bilinear")
+            rev_dist = revealNet(dist, scale)
 
-        loss = loss_stage_1 + loss_stage_2 + loss_dist + loss_rev_dist
+            # Reconstruction losses
+            loss_hr = loss_fn[1](restored_hr, lr_1_2)
+            loss_hr_2 = loss_fn[1](restored_hr2, hr)
+            loss_sec = loss_fn[1](sec, recovered)
+            loss_sec_2 = loss_fn[1](sec_2, recovered_2)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            # Low-frequency consistency (Haar-DWT, LL subband)
+            if lambda_freq != 0.0:
+                ll_stego_1 = dwt(restored_hr).narrow(1, 0, restored_hr.shape[1])
+                ll_cover_1 = dwt(lr_1_2).narrow(1, 0, lr_1_2.shape[1])
+                l_freq_1 = torch.nn.functional.l1_loss(ll_stego_1, ll_cover_1)
+
+                ll_stego_2 = dwt(restored_hr2).narrow(1, 0, restored_hr2.shape[1])
+                ll_cover_2 = dwt(hr).narrow(1, 0, hr.shape[1])
+                l_freq_2 = torch.nn.functional.l1_loss(ll_stego_2, ll_cover_2)
+            else:
+                l_freq_1 = 0.0
+                l_freq_2 = 0.0
+
+            # Perceptual consistency on stego vs. cover for both stages
+            if lambda_perc != 0.0 and perc_crit is not None:
+                l_perc_1 = perc_crit(restored_hr, lr_1_2)
+                l_perc_2 = perc_crit(restored_hr2, hr)
+            else:
+                l_perc_1 = 0.0
+                l_perc_2 = 0.0
+
+            loss_dist = loss_fn[1](dist, restored_hr)
+            loss_rev_dist = loss_fn[1](rev_dist, sec)
+
+            # Stage-wise loss with optional low-frequency and perceptual terms
+            loss_stage_1 = loss_hr + loss_sec \
+                            + (lambda_freq * l_freq_1 if isinstance(l_freq_1, torch.Tensor) else 0.0) \
+                            + (lambda_perc * l_perc_1 if isinstance(l_perc_1, torch.Tensor) else 0.0)
+            loss_stage_2 = loss_hr_2 + loss_sec_2 \
+                            + (lambda_freq * l_freq_2 if isinstance(l_freq_2, torch.Tensor) else 0.0) \
+                            + (lambda_perc * l_perc_2 if isinstance(l_perc_2, torch.Tensor) else 0.0)
+
+            loss = loss_stage_1 + loss_stage_2 + loss_dist + loss_rev_dist
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
         batch_time.update(time.time() - end)
         end = time.time()
+        # Ensure loss_imp is always defined for logging
+        if epoch >= warmup_imp_epochs:
+            loss_imp = torch.tensor(0.0, device=hr.device)
         for m, x in zip([loss_meter, loss_hr_meter, loss_hr_meter2, loss_sec_meter, loss_sec_meter2,
-                         lfreq1_meter, lfreq2_meter, lperc1_meter, lperc2_meter],
+                         lfreq1_meter, lfreq2_meter, lperc1_meter, lperc2_meter, limp_meter],
                         [loss, loss_hr, loss_hr_2, loss_sec, loss_sec_2,
-                         l_freq_1, l_freq_2, l_perc_1, l_perc_2]):
+                         l_freq_1, l_freq_2, l_perc_1, l_perc_2, loss_imp]):
             val_x = x.item() if isinstance(x, torch.Tensor) else float(x)
             m.update(val_x, lr_1_4.shape[0])
         # Adjust lr
-        if cfg.poly_lr:
-            current_lr = poly_learning_rate(cfg.base_lr, current_iter, max_iter, power=cfg.power)
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = current_lr
+        if epoch < warmup_imp_epochs:
+            # Track LR of imp optimizer during warmup
+            if cfg.poly_lr:
+                current_lr = poly_learning_rate(cfg.base_lr, current_iter, max_iter, power=cfg.power)
+                for param_group in optimizer_imp.param_groups:
+                    param_group['lr'] = current_lr
+            else:
+                current_lr = optimizer_imp.param_groups[0]['lr']
         else:
-            current_lr = optimizer.param_groups[0]['lr']
+            if cfg.poly_lr:
+                current_lr = poly_learning_rate(cfg.base_lr, current_iter, max_iter, power=cfg.power)
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = current_lr
+            else:
+                current_lr = optimizer.param_groups[0]['lr']
 
         with torch.no_grad():
             batch_enc_psnr = abs(kornia.losses.psnr_loss(restored_hr, lr_1_2, 1))
@@ -448,6 +527,7 @@ def train(train_loader, model, revealNet, revealNet_2, imp_net, loss_fn, optimiz
                         'Loss_sec: {loss_sec_meter.val:.4f} '
                         'Loss_hr2: {loss_hr_meter2.val:.4f} '
                         'Loss_sec2: {loss_sec_meter2.val:.4f} '
+                        'L_imp: {limp_meter.val:.4f} '
                         'L_freq1: {lfreq1_meter.val:.4f} '
                         'L_freq2: {lfreq2_meter.val:.4f} '
                         'L_perc1: {lperc1_meter.val:.4f} '
@@ -461,6 +541,7 @@ def train(train_loader, model, revealNet, revealNet_2, imp_net, loss_fn, optimiz
                                 loss_sec_meter=loss_sec_meter,
                                 loss_hr_meter2=loss_hr_meter2,
                                 loss_sec_meter2=loss_sec_meter2,
+                                limp_meter=limp_meter,
                                 lfreq1_meter=lfreq1_meter,
                                 lfreq2_meter=lfreq2_meter,
                                 lperc1_meter=lperc1_meter,
@@ -468,9 +549,9 @@ def train(train_loader, model, revealNet, revealNet_2, imp_net, loss_fn, optimiz
                                 data_result_info=data_result_info
                                 ))
             for m, s in zip([loss_meter, loss_hr_meter, loss_sec_meter, loss_hr_meter2, loss_sec_meter2,
-                             lfreq1_meter, lfreq2_meter, lperc1_meter, lperc2_meter],
+                             limp_meter, lfreq1_meter, lfreq2_meter, lperc1_meter, lperc2_meter],
                             ["train_batch/loss", "train_batch/loss_hr", "train_batch/loss_sec", "train_batch/loss_hr2",
-                             "train_batch/loss_sec2", "train_batch/l_freq1", "train_batch/l_freq2",
+                             "train_batch/loss_sec2", "train_batch/l_imp", "train_batch/l_freq1", "train_batch/l_freq2",
                              "train_batch/l_perc1", "train_batch/l_perc2"]):
                 writer.add_scalar(s, m.val, current_iter)
             writer.add_scalar('learning_rate', current_lr, current_iter)
@@ -481,6 +562,7 @@ def train(train_loader, model, revealNet, revealNet_2, imp_net, loss_fn, optimiz
         writer.add_scalar('train/l_freq2', lfreq2_meter.avg, epoch + 1)
         writer.add_scalar('train/l_perc1', lperc1_meter.avg, epoch + 1)
         writer.add_scalar('train/l_perc2', lperc2_meter.avg, epoch + 1)
+        writer.add_scalar('train/l_imp', limp_meter.avg, epoch + 1)
     return loss_meter.avg, loss_hr_meter.avg, loss_sec_meter.avg
 
 
@@ -521,10 +603,12 @@ def validate(val_loader, model, revealNet, revealNet_2, imp_net, loss_fn, epoch,
             lr_1_2 = imresize(hr, scale=1.0 / scale).detach()
 
             sec = imresize(sec_gt, scale=1.0 / (scale * scale)).detach()
-            sec_imp = imresize(sec_gt, scale=1.0 / scale).detach()
             sec_2 = imresize(sec_gt2, scale=1.0 / scale).detach()
 
-            imp_map = imp_net(lr_1_2, sec_imp, sec_2)
+            # Two-pass evaluation: get sr_1, then compute imp_map and final outputs
+            zero_imp = torch.zeros_like(lr_1_2)
+            sr_1_tmp, _ = model(lr_1_4, sec, sec_2, zero_imp, scale)
+            imp_map = imp_net(lr_1_2, sec_2, sr_1_tmp)
             restored_hr, restored_hr2 = model(lr_1_4, sec, sec_2, imp_map, scale)
 
             recovered = revealNet(restored_hr, scale)
