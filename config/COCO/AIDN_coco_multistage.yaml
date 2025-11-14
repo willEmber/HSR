@@ -56,7 +56,7 @@ TRAIN:
   patience: 3
   threshold: 0.00025
   poly_lr: False
-  epochs: 800
+  epochs: 500
   start_epoch: 0
   power: 0.9
   momentum: 0.9
@@ -71,10 +71,10 @@ TRAIN:
   evaluate: True
   eval_freq: 20
   # 多阶段训练参数（供 main/train_multistage.py 使用，数值可自行调整）
-  sr_pretrain_epochs: 0      # 阶段1：仅SR/可逆主干
-  hide_pretrain_epochs: 0    # 阶段2：隐写+解密，但不使用IM
-  im_warmup_epochs: 0        # 阶段3：仅训练IM，拟合 (x_stego_(t−1) − x_cover)
-  warmup_imp_epochs: 0       # 与旧脚本兼容，使用本配置时建议保持为0
+  sr_pretrain_epochs: 40 # 阶段1：仅SR/可逆主干
+  hide_pretrain_epochs: 50 # 阶段2：隐写+解密，但不使用IM
+  im_warmup_epochs: 10 # 阶段3：仅训练IM，拟合 (x_stego_(t−1) − x_cover)
+  warmup_imp_epochs: 0 # 与旧脚本兼容，使用本配置时建议保持为0
 
 Distributed:
   dist_url: tcp://127.0.0.1:6799
@@ -96,4 +96,3 @@ TEST:
   model_path:
   save_folder:
   benchmark: False
-
