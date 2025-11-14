@@ -17,11 +17,8 @@ LOSS:
   loss_lr_weight: 1.0
   # Hyper-parameters for auxiliary losses
   lada: 1.0
-  # Stronger low-frequency consistency between stego and cover
-  lambda_freq: 2.0
-  # Stronger perceptual similarity between stego and cover
-  lambda_perc: 0.02
-  # Importance-map warmup loss weight
+  lambda_freq: 1.0
+  lambda_perc: 0.01
   lambda_imp: 1.0
 
 NETWORK:
@@ -68,12 +65,16 @@ TRAIN:
   print_freq: 10
   save_freq: 1
   save_path:
-  # Fine-tune starting from your previous COCO checkpoint
-  weight: LOG/COCO/train_2x_loop2_1005/model/AIDN.pth.tar
+  # 通常从 DIV2K 预训练权重开始微调
+  weight: LOG/DIV2K/pre-train/AIDN_pretrainedx4.pth.tar
   resume:
   evaluate: True
   eval_freq: 20
-  warmup_imp_epochs: 0
+  # 多阶段训练参数（供 main/train_multistage.py 使用，数值可自行调整）
+  sr_pretrain_epochs: 0      # 阶段1：仅SR/可逆主干
+  hide_pretrain_epochs: 0    # 阶段2：隐写+解密，但不使用IM
+  im_warmup_epochs: 0        # 阶段3：仅训练IM，拟合 (x_stego_(t−1) − x_cover)
+  warmup_imp_epochs: 0       # 与旧脚本兼容，使用本配置时建议保持为0
 
 Distributed:
   dist_url: tcp://127.0.0.1:6799
@@ -83,7 +84,7 @@ Distributed:
   rank: 0
 
 TEST:
-  exp_name: AIDN_COCO_FT
+  exp_name: AIDN_COCO_multistage
   test_root: ../Data/
   test_dataset: Set5
   test_scale: 1.5+2.5+3.5
@@ -95,3 +96,4 @@ TEST:
   model_path:
   save_folder:
   benchmark: False
+

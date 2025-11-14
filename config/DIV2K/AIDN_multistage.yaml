@@ -1,0 +1,102 @@
+DATA:
+  data_name: DIV2K
+  data_root: /data/project/dataset/DIV2K/DIV2K
+  train_set: /data/project/dataset/DIV2K/DIV2K/train.txt
+  val_set: /data/project/dataset/DIV2K/DIV2K/valid.txt
+  loop: 1
+  # todo 记得每次要调整todo内容 ==> patch_size
+  patch_size: 192
+  hflip: True
+  rotation: True
+  rgb_range: 1.0
+  debug: False
+  balanceS: True # whether the balancing of training scales are applied
+
+LOSS:
+  loss_lr_weight: 1.0
+  # todo 记得每次要调整todo内容 ==> lada
+  lada: 1.0 # 用于提高sr图像的质量的超参数
+  # 低频一致性损失（Haar-DWT，LL子带）权重 λf
+  lambda_freq: 1.0
+  # 感知损失（VGG16特征）权重 λp
+  lambda_perc: 0.01
+  # 重要性图预热阶段损失（仅预热阶段启用）权重 λimp
+  lambda_imp: 1.0
+
+NETWORK:
+  base_resolution: 4
+  arch: InvEDRS_arb
+  up_sampler: sampleB
+  down_sampler: sampleB
+  n_resblocks: 16
+  n_feats: 64
+  fixed_scale: False # old: False
+  scale: 2
+  rescale: # not used
+  n_colors: 3
+  res_scale: 1
+  quantization: True
+  quantization_type: round_soft
+  K: 4
+  num_experts_SAconv: 4
+  num_experts_CRM: 8
+  jpeg: False
+  # jpeg_type: DiffJPEG
+
+TRAIN:
+  use_sgd: False
+  sync_bn: True # adopt sync_bn or not
+  train_gpu: [0]
+  workers: 16 # data loader workers
+  # todo 记得每次要调整todo内容 ==> batch_size  288: 5  432 : 2
+  batch_size: 20 # batch size for training
+  batch_size_val: 16 # batch size for validation during training, memory and speed tradeoff
+  base_lr: 0.0001
+  StepLR: True
+  step_size: 60
+  gamma: 0.5
+  adaptive_lr: False
+  factor: 0.3
+  patience: 3
+  threshold: 0.00025
+  poly_lr: False
+  epochs: 1200 # 300
+  start_epoch: 0
+  power: 0.9
+  momentum: 0.9
+  weight_decay: 0.002
+  manual_seed: 131
+  print_freq: 10
+  save_freq: 1
+  save_path:
+  weight: LOG/DIV2K/pre-train/AIDN_pretrainedx4.pth.tar
+  resume:
+  evaluate: True # evaluate on validation set, extra gpu memory needed and small batch_size_val is recommend
+  eval_freq: 20
+  # 多阶段训练参数（供 main/train_multistage.py 使用，数值可自行调整）
+  sr_pretrain_epochs: 400 # 阶段1：仅SR/可逆主干
+  hide_pretrain_epochs: 300 # 阶段2：隐写+解密，但不使用IM
+  im_warmup_epochs: 100 # 阶段3：仅训练IM，拟合 (x_stego_(t−1) − x_cover)
+  warmup_imp_epochs: 0 # 与旧脚本兼容，使用本配置时建议保持为0
+
+Distributed:
+  dist_url: tcp://127.0.0.1:6799
+  dist_backend: "nccl"
+  multiprocessing_distributed: True
+  world_size: 1
+  rank: 0
+
+TEST:
+  exp_name: AIDN_multistage
+  test_root: ../Data/
+  #  test_dataset: Set5+Set14+BSDS100+urban100
+  test_dataset: Set5
+  test_scale: 1.5+2.5+3.5
+  save: True
+  split: val
+  test_workers: 2
+  test_gpu: [0]
+  test_batch_size: 1
+  model_path:
+  save_folder:
+  benchmark: False
