@@ -88,11 +88,11 @@ TRAIN:
   #   2）使用 sr_pretrain_epochs + hide_pretrain_epochs 之和。
   #
   # 下面给一组保守默认值，你可以根据训练曲线自行再调大/调小。
-  sr_pretrain_epochs: 0     # 不再单独做 SR-only 阶段
-  hide_pretrain_epochs: 160 # 前 160 个 epoch 关闭 IM，联合训练 IH+reveal
-  im_start_epoch: 160       # 等价于上面两个和，可以直接改这个数
-  im_warmup_epochs: 0       # 已不再使用，保持为 0
-  warmup_imp_epochs: 0      # 仅供旧脚本兼容，保持为0
+  sr_pretrain_epochs: 0 # 不再单独做 SR-only 阶段
+  hide_pretrain_epochs: 300 # 前 160 个 epoch 关闭 IM，联合训练 IH+reveal
+  im_start_epoch: 300 # 等价于上面两个和，可以直接改这个数
+  im_warmup_epochs: 0 # 已不再使用，保持为 0
+  warmup_imp_epochs: 0 # 仅供旧脚本兼容，保持为0
 
 Distributed:
   dist_url: tcp://127.0.0.1:6799

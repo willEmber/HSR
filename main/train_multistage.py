@@ -420,6 +420,11 @@ def train(
     lambda_freq = float(getattr(cfg, "lambda_freq", 0.0))
     lambda_perc = float(getattr(cfg, "lambda_perc", 0.0))
     lambda_imp = float(getattr(cfg, "lambda_imp", 1.0))
+    # 频段权重：鼓励秘密信息更多落在中频 (HL/LH)，
+    # 同时更强地约束低频 (LL) 和高频 (HH) 的改动，减少与超分辨率高频细节的冲突。
+    freq_weight_low = float(getattr(cfg, "freq_weight_low", 1.0))
+    freq_weight_mid = float(getattr(cfg, "freq_weight_mid", 0.3))
+    freq_weight_high = float(getattr(cfg, "freq_weight_high", 2.0))
 
     perc_crit = None
     if lambda_perc != 0.0:
@@ -492,13 +497,52 @@ def train(
             loss_sec_2 = loss_fn[1](sec_2, recovered_2)
 
             if lambda_freq != 0.0:
-                ll_stego_1 = dwt(restored_hr).narrow(1, 0, restored_hr.shape[1])
-                ll_cover_1 = dwt(lr_1_2).narrow(1, 0, lr_1_2.shape[1])
-                l_freq_1 = torch.nn.functional.l1_loss(ll_stego_1, ll_cover_1)
+                # 将 DWT 系数拆分为 LL / HL / LH / HH 四个子带
+                coeff_stego_1 = dwt(restored_hr)
+                coeff_cover_1 = dwt(lr_1_2)
+                c_ll_s1, c_hl_s1, c_lh_s1, c_hh_s1 = torch.chunk(
+                    coeff_stego_1, 4, dim=1
+                )
+                c_ll_c1, c_hl_c1, c_lh_c1, c_hh_c1 = torch.chunk(
+                    coeff_cover_1, 4, dim=1
+                )
 
-                ll_stego_2 = dwt(restored_hr2).narrow(1, 0, restored_hr2.shape[1])
-                ll_cover_2 = dwt(hr).narrow(1, 0, hr.shape[1])
-                l_freq_2 = torch.nn.functional.l1_loss(ll_stego_2, ll_cover_2)
+                coeff_stego_2 = dwt(restored_hr2)
+                coeff_cover_2 = dwt(hr)
+                c_ll_s2, c_hl_s2, c_lh_s2, c_hh_s2 = torch.chunk(
+                    coeff_stego_2, 4, dim=1
+                )
+                c_ll_c2, c_hl_c2, c_lh_c2, c_hh_c2 = torch.chunk(
+                    coeff_cover_2, 4, dim=1
+                )
+
+                # 低频 (LL)：保持整体结构
+                low_1 = F.l1_loss(c_ll_s1, c_ll_c1)
+                low_2 = F.l1_loss(c_ll_s2, c_ll_c2)
+
+                # 中频 (HL/LH)：允许一定改动，用于承载秘密信息
+                mid_s1 = torch.cat((c_hl_s1, c_lh_s1), dim=1)
+                mid_c1 = torch.cat((c_hl_c1, c_lh_c1), dim=1)
+                mid_s2 = torch.cat((c_hl_s2, c_lh_s2), dim=1)
+                mid_c2 = torch.cat((c_hl_c2, c_lh_c2), dim=1)
+                mid_1 = F.l1_loss(mid_s1, mid_c1)
+                mid_2 = F.l1_loss(mid_s2, mid_c2)
+
+                # 高频 (HH)：更强约束，尽量减少对 SR 高频细节的干扰
+                high_1 = F.l1_loss(c_hh_s1, c_hh_c1)
+                high_2 = F.l1_loss(c_hh_s2, c_hh_c2)
+
+                # 汇总为一个频域正则项，后续统一乘以 lambda_freq
+                l_freq_1 = (
+                    freq_weight_low * low_1
+                    + freq_weight_mid * mid_1
+                    + freq_weight_high * high_1
+                )
+                l_freq_2 = (
+                    freq_weight_low * low_2
+                    + freq_weight_mid * mid_2
+                    + freq_weight_high * high_2
+                )
 
             if lambda_perc != 0.0 and perc_crit is not None:
                 l_perc_1 = perc_crit(restored_hr, lr_1_2)
@@ -554,13 +598,47 @@ def train(
             loss_sec_2 = loss_fn[1](sec_2, recovered_2)
 
             if lambda_freq != 0.0:
-                ll_stego_1 = dwt(restored_hr).narrow(1, 0, restored_hr.shape[1])
-                ll_cover_1 = dwt(lr_1_2).narrow(1, 0, lr_1_2.shape[1])
-                l_freq_1 = torch.nn.functional.l1_loss(ll_stego_1, ll_cover_1)
+                coeff_stego_1 = dwt(restored_hr)
+                coeff_cover_1 = dwt(lr_1_2)
+                c_ll_s1, c_hl_s1, c_lh_s1, c_hh_s1 = torch.chunk(
+                    coeff_stego_1, 4, dim=1
+                )
+                c_ll_c1, c_hl_c1, c_lh_c1, c_hh_c1 = torch.chunk(
+                    coeff_cover_1, 4, dim=1
+                )
 
-                ll_stego_2 = dwt(restored_hr2).narrow(1, 0, restored_hr2.shape[1])
-                ll_cover_2 = dwt(hr).narrow(1, 0, hr.shape[1])
-                l_freq_2 = torch.nn.functional.l1_loss(ll_stego_2, ll_cover_2)
+                coeff_stego_2 = dwt(restored_hr2)
+                coeff_cover_2 = dwt(hr)
+                c_ll_s2, c_hl_s2, c_lh_s2, c_hh_s2 = torch.chunk(
+                    coeff_stego_2, 4, dim=1
+                )
+                c_ll_c2, c_hl_c2, c_lh_c2, c_hh_c2 = torch.chunk(
+                    coeff_cover_2, 4, dim=1
+                )
+
+                low_1 = F.l1_loss(c_ll_s1, c_ll_c1)
+                low_2 = F.l1_loss(c_ll_s2, c_ll_c2)
+
+                mid_s1 = torch.cat((c_hl_s1, c_lh_s1), dim=1)
+                mid_c1 = torch.cat((c_hl_c1, c_lh_c1), dim=1)
+                mid_s2 = torch.cat((c_hl_s2, c_lh_s2), dim=1)
+                mid_c2 = torch.cat((c_hl_c2, c_lh_c2), dim=1)
+                mid_1 = F.l1_loss(mid_s1, mid_c1)
+                mid_2 = F.l1_loss(mid_s2, mid_c2)
+
+                high_1 = F.l1_loss(c_hh_s1, c_hh_c1)
+                high_2 = F.l1_loss(c_hh_s2, c_hh_c2)
+
+                l_freq_1 = (
+                    freq_weight_low * low_1
+                    + freq_weight_mid * mid_1
+                    + freq_weight_high * high_1
+                )
+                l_freq_2 = (
+                    freq_weight_low * low_2
+                    + freq_weight_mid * mid_2
+                    + freq_weight_high * high_2
+                )
 
             if lambda_perc != 0.0 and perc_crit is not None:
                 l_perc_1 = perc_crit(restored_hr, lr_1_2)
@@ -800,6 +878,9 @@ def validate(val_loader, model, revealNet, revealNet_2, imp_net, loss_fn, epoch:
     dwt = DWT()
     lambda_freq = float(getattr(cfg, "lambda_freq", 0.0))
     lambda_perc = float(getattr(cfg, "lambda_perc", 0.0))
+    freq_weight_low = float(getattr(cfg, "freq_weight_low", 1.0))
+    freq_weight_mid = float(getattr(cfg, "freq_weight_mid", 0.3))
+    freq_weight_high = float(getattr(cfg, "freq_weight_high", 2.0))
 
     perc_crit = None
     if lambda_perc != 0.0:
@@ -842,13 +923,47 @@ def validate(val_loader, model, revealNet, revealNet_2, imp_net, loss_fn, epoch:
             loss_rev_dist = loss_fn[1](rev_dist, sec)
 
             if lambda_freq != 0.0:
-                ll_stego_1 = dwt(restored_hr).narrow(1, 0, restored_hr.shape[1])
-                ll_cover_1 = dwt(lr_1_2).narrow(1, 0, lr_1_2.shape[1])
-                l_freq_1 = torch.nn.functional.l1_loss(ll_stego_1, ll_cover_1)
+                coeff_stego_1 = dwt(restored_hr)
+                coeff_cover_1 = dwt(lr_1_2)
+                c_ll_s1, c_hl_s1, c_lh_s1, c_hh_s1 = torch.chunk(
+                    coeff_stego_1, 4, dim=1
+                )
+                c_ll_c1, c_hl_c1, c_lh_c1, c_hh_c1 = torch.chunk(
+                    coeff_cover_1, 4, dim=1
+                )
 
-                ll_stego_2 = dwt(restored_hr2).narrow(1, 0, restored_hr2.shape[1])
-                ll_cover_2 = dwt(hr).narrow(1, 0, hr.shape[1])
-                l_freq_2 = torch.nn.functional.l1_loss(ll_stego_2, ll_cover_2)
+                coeff_stego_2 = dwt(restored_hr2)
+                coeff_cover_2 = dwt(hr)
+                c_ll_s2, c_hl_s2, c_lh_s2, c_hh_s2 = torch.chunk(
+                    coeff_stego_2, 4, dim=1
+                )
+                c_ll_c2, c_hl_c2, c_lh_c2, c_hh_c2 = torch.chunk(
+                    coeff_cover_2, 4, dim=1
+                )
+
+                low_1 = F.l1_loss(c_ll_s1, c_ll_c1)
+                low_2 = F.l1_loss(c_ll_s2, c_ll_c2)
+
+                mid_s1 = torch.cat((c_hl_s1, c_lh_s1), dim=1)
+                mid_c1 = torch.cat((c_hl_c1, c_lh_c1), dim=1)
+                mid_s2 = torch.cat((c_hl_s2, c_lh_s2), dim=1)
+                mid_c2 = torch.cat((c_hl_c2, c_lh_c2), dim=1)
+                mid_1 = F.l1_loss(mid_s1, mid_c1)
+                mid_2 = F.l1_loss(mid_s2, mid_c2)
+
+                high_1 = F.l1_loss(c_hh_s1, c_hh_c1)
+                high_2 = F.l1_loss(c_hh_s2, c_hh_c2)
+
+                l_freq_1 = (
+                    freq_weight_low * low_1
+                    + freq_weight_mid * mid_1
+                    + freq_weight_high * high_1
+                )
+                l_freq_2 = (
+                    freq_weight_low * low_2
+                    + freq_weight_mid * mid_2
+                    + freq_weight_high * high_2
+                )
             else:
                 l_freq_1 = 0.0
                 l_freq_2 = 0.0
