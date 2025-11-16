@@ -1,0 +1,605 @@
+#!/usr/bin/env python
+import itertools
+import os
+import sys
+import time
+import random
+
+import kornia
+import numpy as np
+import torch.backends.cudnn as cudnn
+import torchvision
+import torch.nn.parallel
+import torch.optim
+import torch.utils.data
+import torch.multiprocessing as mp
+import torch.distributed as dist
+from tensorboardX import SummaryWriter
+import cv2
+
+# Use current directory instead of hardcoded path
+# sys.path.append("/opt/data/xiaobin/AIDN")
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from base.baseTrainer import poly_learning_rate, reduce_tensor, save_checkpoint, load_state_dict, save_checkpoint_imp
+from base.utilities import get_parser, get_logger, main_process, AverageMeter
+from models.RevealNet import RevealNet
+from models.imp_subnet_DeepMIH import ImpMapBlock
+from models import get_model
+from metrics.loss import *
+from metrics import psnr, ssim
+from metrics.perceptual import PerceptualLoss
+from dataset.torch_bicubic import imresize
+from torch.optim.lr_scheduler import StepLR
+from random import choices
+from utils.alignment import align_tensor_size
+
+cv2.ocl.setUseOpenCL(False)
+cv2.setNumThreads(0)
+
+population = [i / 10.0 for i in range(11, 41)]
+weights = [i ** 2 for i in population]
+
+weights_np = np.array(weights)
+weights_np_sum = np.sum(weights_np)
+weights = [i / weights_np_sum for i in weights]
+
+
+def main():
+    args = get_parser()
+    # os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(str(x) for x in args.train_gpu)
+    os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+
+    cudnn.benchmark = True
+
+    if args.manual_seed is not None:
+        random.seed(args.manual_seed)
+        np.random.seed(args.manual_seed)
+        torch.manual_seed(args.manual_seed)
+        torch.cuda.manual_seed(args.manual_seed)
+        torch.cuda.manual_seed_all(args.manual_seed)
+        # cudnn.benchmark = False
+        # cudnn.deterministic = True
+
+    if args.dist_url == "env://" and args.world_size == -1:
+        args.world_size = int(os.environ["WORLD_SIZE"])
+    args.distributed = args.world_size > 1 or args.multiprocessing_distributed
+    args.ngpus_per_node = len(args.train_gpu)
+    if len(args.train_gpu) == 1:
+        args.train_gpu = args.train_gpu[0]
+        args.sync_bn = False
+        args.distributed = False
+        args.multiprocessing_distributed = False
+
+    if args.multiprocessing_distributed:
+        args.world_size = args.ngpus_per_node * args.world_size
+        mp.spawn(main_worker, nprocs=args.ngpus_per_node, args=(args.ngpus_per_node, args))
+    else:
+        main_worker(args.train_gpu, args.ngpus_per_node, args)
+
+
+def worker_init_fn(worker_id):
+    manual_seed = 131
+    random.seed(manual_seed + worker_id)
+    np.random.seed(manual_seed + worker_id)
+    torch.manual_seed(manual_seed + worker_id)
+    torch.cuda.manual_seed(manual_seed + worker_id)
+    torch.cuda.manual_seed_all(manual_seed + worker_id)
+
+
+def custom_collate_fn(batch):
+    """Custom collate function to handle potential tensor size mismatches."""
+    try:
+        return torch.utils.data.dataloader.default_collate(batch)
+    except RuntimeError as e:
+        error_msg = str(e)
+        if "resize storage" in error_msg or "stack expects each tensor to be equal size" in error_msg:
+            # Handle size mismatch by ensuring all tensors have the same size
+            # Find the minimum size across all samples
+            min_h = min([sample['img_gt'].shape[1] for sample in batch])
+            min_w = min([sample['img_gt'].shape[2] for sample in batch])
+
+            # Crop all tensors to the minimum size
+            for sample in batch:
+                for key in sample:
+                    if isinstance(sample[key], torch.Tensor) and len(sample[key].shape) == 3:
+                        h, w = sample[key].shape[1], sample[key].shape[2]
+                        if h > min_h or w > min_w:
+                            start_h = (h - min_h) // 2
+                            start_w = (w - min_w) // 2
+                            sample[key] = sample[key][:, start_h:start_h+min_h, start_w:start_w+min_w]
+
+            return torch.utils.data.dataloader.default_collate(batch)
+        else:
+            raise e
+
+
+def main_worker(gpu, ngpus_per_node, args):
+    cfg = args
+    cfg.gpu = gpu
+    best_metric = 1e10
+    if cfg.distributed:
+        if cfg.dist_url == "env://" and cfg.rank == -1:
+            cfg.rank = int(os.environ["RANK"])
+        if cfg.multiprocessing_distributed:
+            cfg.rank = cfg.rank * ngpus_per_node + gpu
+        dist.init_process_group(backend=cfg.dist_backend, init_method=cfg.dist_url, world_size=cfg.world_size,
+                                rank=cfg.rank)
+    # ####################### Model ####################### #
+    global logger, writer
+    logger = get_logger()
+    writer = SummaryWriter(cfg.save_path)
+    model = get_model(cfg, logger)
+    revealNet = RevealNet(input_nc=3, output_nc=3, cfg=cfg)
+    revealNet_2 = RevealNet(input_nc=3, output_nc=3, cfg=cfg)
+    imp_net = ImpMapBlock()
+    perceptual_loss_fn = PerceptualLoss()
+
+    if cfg.sync_bn:
+        logger.info("using DDP synced BN")
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        revealNet = torch.nn.SyncBatchNorm.convert_sync_batchnorm(revealNet)
+        revealNet_2 = torch.nn.SyncBatchNorm.convert_sync_batchnorm(revealNet_2)
+        imp_net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(imp_net)
+    if main_process(cfg):
+        logger.info(cfg)
+        logger.info("=> creating model ...")
+        model.summary(logger, writer)
+    if cfg.distributed:
+        torch.cuda.set_device(gpu)
+        cfg.batch_size = int(cfg.batch_size / ngpus_per_node)
+        cfg.batch_size_val = int(cfg.batch_size_val / ngpus_per_node)
+        cfg.workers = int(cfg.workers / ngpus_per_node)
+        model = torch.nn.parallel.DistributedDataParallel(model.cuda(gpu), device_ids=[gpu])
+        revealNet = torch.nn.parallel.DistributedDataParallel(revealNet.cuda(gpu), device_ids=[gpu])
+        revealNet_2 = torch.nn.parallel.DistributedDataParallel(revealNet_2.cuda(gpu), device_ids=[gpu])
+        imp_net = torch.nn.parallel.DistributedDataParallel(imp_net.cuda(gpu), device_ids=[gpu])
+        perceptual_loss_fn = perceptual_loss_fn.cuda(gpu)
+    else:
+        torch.cuda.set_device(gpu)
+        model = model.cuda()
+        revealNet = revealNet.cuda()
+        revealNet_2 = revealNet_2.cuda()
+        imp_net = imp_net.cuda()
+        perceptual_loss_fn = perceptual_loss_fn.cuda()
+        # model = torch.nn.DataParallel(model.cuda(), device_ids=gpu)
+    # ####################### Loss ####################### #
+    loss_fn_lr = nn.MSELoss()
+    loss_fn_hr = nn.L1Loss()
+    loss = [loss_fn_lr, loss_fn_hr]
+
+    # ####################### Optimizer ####################### #
+    if cfg.use_sgd:
+        optimizer = torch.optim.SGD(
+            itertools.chain(model.parameters(), revealNet.parameters(), revealNet_2.parameters(), imp_net.parameters()), lr=cfg.base_lr,
+            momentum=cfg.momentum,
+            weight_decay=cfg.weight_decay)
+    else:
+        optimizer = torch.optim.Adam(
+            itertools.chain(model.parameters(), revealNet.parameters(), revealNet_2.parameters(), imp_net.parameters()), lr=cfg.base_lr)
+
+    if cfg.weight:
+        if os.path.isfile(cfg.weight):
+            if main_process(cfg):
+                logger.info("=> loading weight '{}'".format(cfg.weight))
+            checkpoint = torch.load(cfg.weight, map_location=torch.device('cpu'))
+
+            load_state_dict(model, checkpoint['state_dict'], strict=False)
+            load_state_dict(revealNet, checkpoint['reveal'], strict=False)
+            load_state_dict(revealNet_2, checkpoint['reveal_2'], strict=False)
+            load_state_dict(imp_net, checkpoint['imp_net'], strict=False)
+
+            if main_process(cfg):
+                logger.info("=> loaded weight '{}'".format(cfg.weight))
+        else:
+            if main_process(cfg):
+                logger.info("=> no weight found at '{}'".format(cfg.weight))
+    if cfg.StepLR:
+        scheduler = StepLR(optimizer, step_size=cfg.step_size, gamma=cfg.gamma)
+    else:
+        scheduler = None
+    if cfg.resume:
+        if os.path.isfile(cfg.resume):
+            if main_process(cfg):
+                logger.info("=> loading checkpoint '{}'".format(cfg.resume))
+            checkpoint = torch.load(cfg.resume, map_location=torch.device('cpu'))
+            load_state_dict(model, checkpoint['state_dict'])
+            load_state_dict(revealNet, checkpoint['reveal'])
+            load_state_dict(revealNet_2, checkpoint['reveal_2'])
+            load_state_dict(imp_net, checkpoint['imp_net'])
+            cfg.start_epoch = checkpoint['epoch']
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            best_metric = checkpoint['best_metric']
+            if cfg.StepLR:
+                scheduler = StepLR(optimizer, step_size=cfg.step_size, gamma=cfg.gamma, last_epoch=cfg.start_epoch - 1)
+                if 'scheduler' in checkpoint:
+                    scheduler.load_state_dict(checkpoint['scheduler'])
+                else:
+                    logger.info("=> no scheduler found in checkpoint, initializing a new one")
+
+            if main_process(cfg):
+                logger.info("=> loaded checkpoint '{}' (epoch {})".format(cfg.resume, checkpoint['epoch']))
+        else:
+            if main_process(cfg):
+                logger.info("=> no checkpoint found at '{}'".format(cfg.resume))
+
+    # ####################### Data Loader ####################### #
+    if cfg.data_name == 'DIV2K':
+        from dataset.div2k import DIV2K
+        train_data = DIV2K(data_list=os.path.join(cfg.data_root, 'list/train.txt'), training=True,
+                           cfg=cfg)
+        val_data = DIV2K(data_list=os.path.join(cfg.data_root, 'list/val.txt'), training=False,
+                         cfg=cfg) if cfg.evaluate else None
+
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_data) if cfg.distributed else None
+        train_loader = torch.utils.data.DataLoader(train_data, batch_size=cfg.batch_size,
+                                                   shuffle=(train_sampler is None),
+                                                   num_workers=cfg.workers, pin_memory=True,
+                                                   sampler=train_sampler,
+                                                   worker_init_fn=worker_init_fn)
+        if cfg.evaluate:
+            val_sampler = torch.utils.data.distributed.DistributedSampler(val_data) if cfg.distributed else None
+            val_loader = torch.utils.data.DataLoader(val_data, batch_size=cfg.batch_size_val,
+                                                     shuffle=False, num_workers=cfg.workers, pin_memory=True,
+                                                     drop_last=False,
+                                                     worker_init_fn=worker_init_fn, sampler=val_sampler,
+                                                     collate_fn=custom_collate_fn)
+    else:
+        raise Exception('Dataset not supported yet'.format(cfg.data_name))
+
+    # ####################### Train ####################### #
+    for epoch in range(cfg.start_epoch, cfg.epochs):
+        if cfg.distributed:
+            train_sampler.set_epoch(epoch)
+            if cfg.evaluate:
+                val_sampler.set_epoch(epoch)
+
+        loss_train, hr_loss, _ = train(train_loader, model, revealNet, revealNet_2, imp_net, loss, perceptual_loss_fn, optimizer, epoch, cfg)
+        epoch_log = epoch + 1
+        # # Adaptive LR
+        if cfg.StepLR:
+            scheduler.step()
+        if main_process(cfg):
+            logger.info('TRAIN Epoch: {} '
+                        'loss_train: {} '
+                        'loss_hr: {} '
+                        .format(epoch_log, loss_train, hr_loss)
+                        )
+            for m, s in zip([loss_train, hr_loss],
+                            ["train/loss", "train/loss_hr"]):
+                writer.add_scalar(s, m, epoch_log)
+
+        is_best = False
+        if cfg.evaluate and (epoch_log % cfg.eval_freq == 0):
+            loss_val, hr_loss, _, PSNR, SSIM = \
+                validate(val_loader, model, revealNet, revealNet_2, imp_net, loss, perceptual_loss_fn, epoch, cfg)
+            if main_process(cfg):
+                logger.info('VAL Epoch: {} '
+                            'loss_val: {:.6} '
+                            'loss_hr: {:.6} '
+                            'PSNR: {:.2},{:.2},{:.2},{:.2} '
+                            'SSIM: {:.4},{:.4},{:.4},{:.4}'
+                            .format(epoch_log, loss_val, hr_loss, *PSNR, *SSIM)
+                            )
+                for m, s in zip([loss_val, hr_loss, *PSNR, *SSIM],
+                                ["val/loss", "val/loss_hr", "val/PSNR_lr", "val/PSNR_hr", "val/SSIM_lr",
+                                 "val/SSIM_hr", "val/PSNR_lr_2", "val/PSNR_hr_2", "val/SSIM_lr_2",
+                                 "val/SSIM_hr_2"]):
+                    writer.add_scalar(s, m, epoch_log)
+
+            # remember best iou and save checkpoint
+            is_best = hr_loss < best_metric
+            best_metric = min(best_metric, hr_loss)
+        if (epoch_log % cfg.save_freq == 0) and main_process(cfg):
+            save_checkpoint_imp(model,
+                            revealNet,
+                            revealNet_2,
+                            imp_net,
+                            other_state={
+                                'epoch': epoch_log,
+                                'state_dict': model.state_dict(),
+                                'reveal': revealNet.state_dict(),
+                                'reveal_2': revealNet_2.state_dict(),
+                                'imp_net': imp_net.state_dict(),
+                                'optimizer': optimizer.state_dict(),
+                                'best_metric': best_metric},
+                            sav_path=os.path.join(cfg.save_path, 'model'),
+                            is_best=is_best
+                            )
+
+
+def train(train_loader, model, revealNet, revealNet_2, imp_net, loss_fn, perceptual_loss_fn, optimizer, epoch, cfg):
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    loss_meter = AverageMeter()
+    loss_hr_meter = AverageMeter()
+    loss_hr_meter2 = AverageMeter()
+    loss_sec_meter = AverageMeter()
+    loss_sec_meter2 = AverageMeter()
+    loss_perc_meter = AverageMeter()
+    model.train()
+    revealNet.train()
+    revealNet_2.train()
+    imp_net.train()
+
+    end = time.time()
+    max_iter = cfg.epochs * len(train_loader)
+    for i, batch in enumerate(train_loader):
+        # pdb.set_trace()
+        if cfg.fixed_scale:  # if training with fixed_scale
+            scale = cfg.scale
+        else:
+            if epoch == 0:
+                scale = 1.5 #random.randint(2, cfg.scale)
+            else:
+                scale = 1.5
+                # if cfg.balanceS:
+                #     scale = choices(population, weights)[0]
+                # else:
+                #     scale = random.randint(11, cfg.scale * 10) / 10.0
+
+        current_iter = epoch * len(train_loader) + i + 1
+        data_time.update(time.time() - end)
+        hr, sec = batch['img_gt'], batch['img_sec']
+        sec_2 = batch['img_sec_2']
+
+        hr = hr.cuda(cfg.gpu, non_blocking=True)
+        sec_gt = sec.cuda(cfg.gpu, non_blocking=True)  # size = hr/scale
+        sec_gt2 = sec_2.cuda(cfg.gpu, non_blocking=True)  # size = hr / (scale*2)
+
+        lr_1_4 = imresize(hr, scale=1.0 / (scale * scale)).detach()
+        lr_1_2 = imresize(hr, scale=1.0 / scale).detach()
+
+        sec = imresize(sec_gt, scale=1.0 / (scale * scale)).detach()
+        sec_imp = imresize(sec_gt, scale=1.0 / scale).detach()
+        sec_2 = imresize(sec_gt2, scale=1.0 / scale).detach()
+
+        imp_map = imp_net(lr_1_2, sec_imp, sec_2)
+        restored_hr, restored_hr2 = model(lr_1_4, sec, sec_2, imp_map, scale)
+        recovered = revealNet(restored_hr, scale)
+        recovered_2 = revealNet_2(restored_hr2, scale)
+
+        _, _, w, h = restored_hr.shape
+        dist = nn.functional.interpolate(restored_hr2, [w, h], mode="bilinear")
+
+        rev_dist = revealNet(dist, scale)
+
+        # Align tensor sizes to avoid dimension mismatch
+        _, _, hr_h, hr_w = hr.shape
+        restored_hr2 = align_tensor_size(restored_hr2, hr_h, hr_w)
+
+        # LOSS
+        # loss_lr = loss_fn[0](encoded_lr, lr)  # 0: MSE 1:L1
+        # 为损失项引入权重
+        weight_hr = 1.0
+        weight_sec = 0.2
+        weight_dist = 0.3
+        weight_perc = getattr(cfg, 'perceptual_weight', 0.0)
+        
+        loss_hr = loss_fn[1](restored_hr, lr_1_2)
+        loss_hr_2 = loss_fn[1](restored_hr2, hr)
+        loss_sec = loss_fn[1](sec, recovered)
+        loss_sec_2 = loss_fn[1](sec_2, recovered_2)
+
+        loss_dist = loss_fn[1](dist, restored_hr)
+        loss_rev_dist = loss_fn[1](rev_dist, sec)
+
+        loss_perc = perceptual_loss_fn(restored_hr2, hr)
+
+        loss = (weight_hr * (loss_hr + loss_hr_2)) + \
+                   (weight_sec * (loss_sec + loss_sec_2)) + \
+                   (weight_dist * (loss_dist + loss_rev_dist)) + \
+                   (weight_perc * loss_perc)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        batch_time.update(time.time() - end)
+        end = time.time()
+        for m, x in zip([loss_meter, loss_hr_meter, loss_hr_meter2, loss_sec_meter, loss_sec_meter2, loss_perc_meter],
+                        [loss, loss_hr, loss_hr_2, loss_sec, loss_sec_2, loss_perc]):
+            m.update(x.item(), lr_1_4.shape[0])
+        # Adjust lr
+        if cfg.poly_lr:
+            current_lr = poly_learning_rate(cfg.base_lr, current_iter, max_iter, power=cfg.power)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = current_lr
+        else:
+            current_lr = optimizer.param_groups[0]['lr']
+
+        with torch.no_grad():
+            batch_enc_psnr = abs(kornia.losses.psnr_loss(restored_hr, lr_1_2, 1))
+            batch_dec_psnr = abs(kornia.losses.psnr_loss(recovered, sec, 1))
+            batch_enc_ssim = 1 - abs(kornia.losses.ssim_loss(restored_hr.detach(), lr_1_2, window_size=5, reduction="mean"))
+            batch_dec_ssim = 1 - abs(kornia.losses.ssim_loss(recovered.detach(), sec, window_size=5, reduction="mean"))
+
+            batch_enc_psnr_2 = abs(kornia.losses.psnr_loss(restored_hr2, hr, 1))
+            batch_dec_psnr_2 = abs(kornia.losses.psnr_loss(recovered_2, sec_2, 1))
+            batch_enc_ssim_2 = 1 - abs(kornia.losses.ssim_loss(restored_hr2.detach(), hr, window_size=5, reduction="mean"))
+            batch_dec_ssim_2 = 1 - abs(
+                kornia.losses.ssim_loss(recovered_2.detach(), sec_2, window_size=5, reduction="mean"))
+
+            batch_dist_psnr = abs(kornia.losses.psnr_loss(dist, restored_hr, 1))
+            batch_redist_psnr = abs(kornia.losses.psnr_loss(rev_dist, sec, 1))
+            batch_dist_ssim = 1 - abs(kornia.losses.ssim_loss(dist.detach(), restored_hr, window_size=5, reduction="mean"))
+            batch_redist_ssim = 1 - abs(kornia.losses.ssim_loss(rev_dist.detach(), sec, window_size=5, reduction="mean"))
+
+
+            data_result_info = ('1/4 SR == psnr_enc:{}, psnr_dec:{}, ssim_enc:{}, ssim_dec:{} '
+                                '1/2 SR == psnr_enc2:{}, psnr_dec2:{}, ssim_enc2:{}, ssim_dec2:{}'
+                                'Dist == psnr_dist:{}, psnr_redist:{}, ssim_dist:{}, ssim_redist:{}'
+                                ).format(batch_enc_psnr, batch_dec_psnr, batch_enc_ssim, batch_dec_ssim,
+                                         batch_enc_psnr_2, batch_dec_psnr_2, batch_enc_ssim_2, batch_dec_ssim_2,
+                                         batch_dist_psnr, batch_redist_psnr, batch_dist_ssim, batch_redist_ssim)
+
+        # calculate remain time
+        remain_iter = max_iter - current_iter
+        remain_time = remain_iter * batch_time.avg
+        t_m, t_s = divmod(remain_time, 60)
+        t_h, t_m = divmod(t_m, 60)
+        remain_time = '{:02d}:{:02d}:{:02d}'.format(int(t_h), int(t_m), int(t_s))
+
+        if (i + 1) % cfg.print_freq == 0 and main_process(cfg):
+            logger.info('Epoch: [{}/{}][{}/{}] '
+                        'Data: {data_time.val:.3f} ({data_time.avg:.3f}) '
+                        'Batch: {batch_time.val:.3f} ({batch_time.avg:.3f}) '
+                        'Remain: {remain_time} '
+                        'Loss: {loss_meter.val:.4f} '
+                        'Loss_hr: {loss_hr_meter.val:.4f} '
+                        'Loss_sec: {loss_sec_meter.val:.4f} '
+                        'Loss_hr2: {loss_hr_meter2.val:.4f} '
+                        'Loss_sec2: {loss_sec_meter2.val:.4f} '
+                        'Loss_perc: {loss_perc_meter.val:.4f} '
+                        'data_info: {data_result_info} '
+                        .format(epoch + 1, cfg.epochs, i + 1, len(train_loader),
+                                batch_time=batch_time, data_time=data_time,
+                                remain_time=remain_time,
+                                loss_meter=loss_meter,
+                                loss_hr_meter=loss_hr_meter,
+                                loss_sec_meter=loss_sec_meter,
+                                loss_hr_meter2=loss_hr_meter2,
+                                loss_sec_meter2=loss_sec_meter2,
+                                loss_perc_meter=loss_perc_meter,
+                                data_result_info=data_result_info
+                                ))
+            for m, s in zip([loss_meter, loss_hr_meter, loss_sec_meter, loss_hr_meter2, loss_sec_meter2, loss_perc_meter],
+                            ["train_batch/loss", "train_batch/loss_hr", "train_batch/loss_sec", "train_batch/loss_hr2",
+                             "train_batch/loss_sec2", "train_batch/loss_perc"]):
+                writer.add_scalar(s, m.val, current_iter)
+            writer.add_scalar('learning_rate', current_lr, current_iter)
+            writer.add_histogram('train_batch/scale', scale, current_iter)
+    return loss_meter.avg, loss_hr_meter.avg, loss_sec_meter.avg
+
+
+def validate(val_loader, model, revealNet, revealNet_2, imp_net, loss_fn, perceptual_loss_fn, epoch, cfg):
+    loss_meter = AverageMeter()
+    loss_hr_meter = AverageMeter()
+    loss_sec_meter = AverageMeter()
+    loss_perc_meter = AverageMeter()
+    psnr_meter, ssim_meter = [AverageMeter() for _ in range(4)], [AverageMeter() for _ in range(4)]
+
+    psnr_calculator, ssim_calculator = psnr.PSNR(), ssim.SSIM()
+
+    model.eval()
+    revealNet.eval()
+    revealNet_2.eval()
+    imp_net.eval()
+    with torch.no_grad():
+        for step, batch in enumerate(val_loader):
+            scale = cfg.scale  # 4
+            hr, sec = batch['img_gt'], batch['img_sec']
+            sec_2 = batch['img_sec_2']
+
+            hr = hr.cuda(cfg.gpu, non_blocking=True)
+            sec_gt = sec.cuda(cfg.gpu, non_blocking=True)  # size = hr/scale
+            sec_gt2 = sec_2.cuda(cfg.gpu, non_blocking=True)  # size = hr / (scale*2)
+
+            lr_1_4 = imresize(hr, scale=1.0 / (scale * scale)).detach()
+            lr_1_2 = imresize(hr, scale=1.0 / scale).detach()
+
+            sec = imresize(sec_gt, scale=1.0 / (scale * scale)).detach()
+            sec_imp = imresize(sec_gt, scale=1.0 / scale).detach()
+            sec_2 = imresize(sec_gt2, scale=1.0 / scale).detach()
+
+            imp_map = imp_net(lr_1_2, sec_imp, sec_2)
+            restored_hr, restored_hr2 = model(lr_1_4, sec, sec_2, imp_map, scale)
+
+            recovered = revealNet(restored_hr, scale)
+            recovered_2 = revealNet_2(restored_hr2, scale)
+
+            _, _, w, h = restored_hr.shape
+            dist = nn.functional.interpolate(restored_hr2, [w, h], mode="bilinear")
+
+            rev_dist = revealNet(dist, scale)
+
+            # Align tensor sizes to avoid dimension mismatch
+            # Crop or pad restored_hr2 to match hr size
+            _, _, hr_h, hr_w = hr.shape
+            _, _, rhr2_h, rhr2_w = restored_hr2.shape
+
+            if rhr2_h != hr_h or rhr2_w != hr_w:
+                if rhr2_h > hr_h or rhr2_w > hr_w:
+                    # Crop restored_hr2 to match hr size
+                    start_h = (rhr2_h - hr_h) // 2
+                    start_w = (rhr2_w - hr_w) // 2
+                    restored_hr2 = restored_hr2[:, :, start_h:start_h+hr_h, start_w:start_w+hr_w]
+                else:
+                    # Pad restored_hr2 to match hr size
+                    pad_h = hr_h - rhr2_h
+                    pad_w = hr_w - rhr2_w
+                    pad_top = pad_h // 2
+                    pad_bottom = pad_h - pad_top
+                    pad_left = pad_w // 2
+                    pad_right = pad_w - pad_left
+                    restored_hr2 = torch.nn.functional.pad(restored_hr2, (pad_left, pad_right, pad_top, pad_bottom), mode='reflect')
+
+            # LOSS
+            # 为损失项引入权重
+            weight_hr = 1.0  # 编码器损失权重
+            weight_sec = 0.5  # 解码器损失权重
+            weight_dist = 0.1 # 失真损失权重
+            weight_perc = getattr(cfg, 'perceptual_weight', 0.0)
+            loss_hr = loss_fn[1](restored_hr, lr_1_2)
+            loss_hr_2 = loss_fn[1](restored_hr2, hr)
+            loss_sec = loss_fn[1](sec, recovered)
+            loss_sec_2 = loss_fn[1](sec_2, recovered_2)
+
+            loss_dist = loss_fn[1](dist, restored_hr)
+            loss_rev_dist = loss_fn[1](rev_dist, sec)
+            loss_perc = perceptual_loss_fn(restored_hr2, hr)
+
+            loss = (weight_hr * (loss_hr + loss_hr_2)) + \
+               (weight_sec * (loss_sec + loss_sec_2)) + \
+               (weight_dist * (loss_dist + loss_rev_dist)) + \
+               (weight_perc * loss_perc)
+
+            psnr_lr, psnr_hr = \
+                psnr_calculator(recovered, sec), psnr_calculator(restored_hr, lr_1_2)
+            ssim_lr, ssim_hr = \
+                ssim_calculator(recovered, sec), ssim_calculator(restored_hr, lr_1_2)
+
+            psnr_lr_2, psnr_hr_2 = \
+                psnr_calculator(recovered_2, sec_2), psnr_calculator(restored_hr2, hr)
+            ssim_lr_2, ssim_hr_2 = \
+                ssim_calculator(recovered_2, sec_2), ssim_calculator(restored_hr2, hr)
+
+            # psnr_dist, psnr_redist = \
+            #     psnr_calculator(dist, restored_hr), psnr_calculator(rev_dist, sec)
+            # ssim_dist, ssim_redist = \
+            #     ssim_calculator(dist, restored_hr), ssim_calculator(rev_dist, sec)
+
+            if cfg.distributed:
+                loss = reduce_tensor(loss, cfg)
+                loss_hr = reduce_tensor(loss_hr, cfg)
+
+                loss_sec = reduce_tensor(loss_sec, cfg)
+                loss_perc = reduce_tensor(loss_perc, cfg)
+
+                psnr_lr = reduce_tensor(psnr_lr, cfg)
+                psnr_hr = reduce_tensor(psnr_hr, cfg)
+                ssim_lr = reduce_tensor(ssim_lr, cfg)
+                ssim_hr = reduce_tensor(ssim_hr, cfg)
+
+                psnr_lr_2 = reduce_tensor(psnr_lr_2, cfg)
+                psnr_hr_2 = reduce_tensor(psnr_hr_2, cfg)
+                ssim_lr_2 = reduce_tensor(ssim_lr_2, cfg)
+                ssim_hr_2 = reduce_tensor(ssim_hr_2, cfg)
+
+
+            for m, x in zip([loss_meter, loss_hr_meter, loss_sec_meter, loss_perc_meter, *psnr_meter, *ssim_meter],
+                            [loss, loss_hr, loss_sec, loss_perc, psnr_lr, psnr_hr, psnr_lr_2, psnr_hr_2,
+                             ssim_lr, ssim_hr, ssim_lr_2, ssim_hr_2]):
+                m.update(x.item(), hr.shape[0])
+
+            # Visualize after validation
+        if main_process(cfg):
+            sample_lr = torchvision.utils.make_grid(recovered.clamp(0.0, 1.0))
+            sample_hr = torchvision.utils.make_grid(restored_hr.clamp(0.0, 1.0))
+            writer.add_image('sample_results/res_lr', sample_lr, epoch + 1)
+            writer.add_image('sample_results/res_hr', sample_hr, epoch + 1)
+
+    return loss_meter.avg, loss_hr_meter.avg, loss_sec_meter.avg, [m.avg for m in psnr_meter], [m.avg for m in ssim_meter]
+
+
+if __name__ == '__main__':
+    main()

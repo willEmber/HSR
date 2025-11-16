@@ -43,25 +43,27 @@ weights = [i / weights_np_sum for i in weights]
 
 def get_train_stage(epoch: int, cfg) -> str:
     """
-    Decide training stage for current epoch.
+    Decide training stage for current epoch (two-stage schedule).
 
-    Stage layout (all durations are configurable in YAML under TRAIN):
-      - sr_pretrain_epochs: only train SR / reversible backbone (no IM, no decode loss)
-      - hide_pretrain_epochs: train hide + reveal (IM disabled)
-      - im_warmup_epochs (or warmup_imp_epochs): only train IM to fit residual
-      - remaining epochs: full end-to-end training (IH + IM + reveal)
+    根据当前 epoch 决定训练阶段（简化为 2 个阶段）：
+      - 前 no_im_epochs 轮：联合训练 SR/IH 与嵌入解密网络，但关闭 IM（阶段名 "hide_reveal"）
+      - 之后：端到端训练 IH + IM + reveal（阶段名 "full"）
+
+    其中 no_im_epochs 默认由 sr_pretrain_epochs + hide_pretrain_epochs 给出，
+    你也可以通过 im_start_epoch 显式指定。
     """
-    sr_pre = int(getattr(cfg, "sr_pretrain_epochs", 0))
-    hide_pre = int(getattr(cfg, "hide_pretrain_epochs", 0))
-    im_warm = int(getattr(cfg, "im_warmup_epochs", getattr(cfg, "warmup_imp_epochs", 0)))
+    # 显式指定 IM 启用起始 epoch 优先
+    im_start_explicit = getattr(cfg, "im_start_epoch", None)
+    if im_start_explicit is not None:
+        no_im_epochs = int(im_start_explicit)
+    else:
+        sr_pre = int(getattr(cfg, "sr_pretrain_epochs", 0))
+        hide_pre = int(getattr(cfg, "hide_pretrain_epochs", 0))
+        no_im_epochs = sr_pre + hide_pre
 
-    if epoch < sr_pre:
-        return "sr_only"
-    if epoch < sr_pre + hide_pre:
-        return "hide_reveal"
-    if epoch < sr_pre + hide_pre + im_warm:
-        return "imp_warmup"
-    return "full"
+    if epoch < no_im_epochs:
+        return "hide_reveal"  # 只训练 IH + reveal，IM 关闭
+    return "full"  # IH + IM + reveal 端到端
 
 
 def main() -> None:
@@ -462,111 +464,8 @@ def train(
         l_perc_1 = 0.0
         l_perc_2 = 0.0
 
-        if train_stage == "imp_warmup":
-            # Phase 3: only train IM to fit residual (sr_1 - cover),
-            # freeze IH + reveal so that residual is meaningful.
-            for p in model.parameters():
-                p.requires_grad = False
-            for p in revealNet.parameters():
-                p.requires_grad = False
-            for p in revealNet_2.parameters():
-                p.requires_grad = False
-            for p in imp_net.parameters():
-                p.requires_grad = True
-
-            zero_imp = torch.zeros_like(lr_1_2)
-            sr_1_tmp, _ = model(lr_1_4, sec, sec_2, zero_imp, scale)
-            res_target = sr_1_tmp.detach() - lr_1_2
-            imp_map = imp_net(lr_1_2, sec_2, sr_1_tmp.detach())
-            loss_imp = torch.nn.functional.l1_loss(imp_map, res_target)
-
-            optimizer_imp.zero_grad()
-            (lambda_imp * loss_imp).backward()
-            optimizer_imp.step()
-
-            # For logging: decode with frozen reveal nets (no grad)
-            restored_hr = sr_1_tmp.detach()
-            with torch.no_grad():
-                recovered = revealNet(restored_hr, scale)
-                restored_hr2 = F.interpolate(
-                    restored_hr,
-                    size=hr.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
-                recovered_2 = revealNet_2(restored_hr2, scale)
-                _, _, w, h = restored_hr.shape
-                dist = F.interpolate(
-                    restored_hr2, [w, h], mode="bilinear", align_corners=False
-                )
-                rev_dist = revealNet(dist, scale)
-
-            loss_hr = torch.tensor(0.0, device=hr.device)
-            loss_hr_2 = torch.tensor(0.0, device=hr.device)
-            loss_sec = torch.tensor(0.0, device=hr.device)
-            loss_sec_2 = torch.tensor(0.0, device=hr.device)
-            loss_dist = torch.tensor(0.0, device=hr.device)
-            loss_rev_dist = torch.tensor(0.0, device=hr.device)
-            loss = lambda_imp * loss_imp
-
-        elif train_stage == "sr_only":
-            # Phase 1: only train IH backbone for SR (no secret loss, no IM).
-            for p in model.parameters():
-                p.requires_grad = True
-            for p in revealNet.parameters():
-                p.requires_grad = False
-            for p in revealNet_2.parameters():
-                p.requires_grad = False
-            for p in imp_net.parameters():
-                p.requires_grad = False
-
-            zero_imp = torch.zeros_like(lr_1_2)
-            restored_hr, restored_hr2 = model(lr_1_4, sec, sec_2, zero_imp, scale)
-
-            with torch.no_grad():
-                recovered = revealNet(restored_hr, scale)
-                recovered_2 = revealNet_2(restored_hr2, scale)
-                _, _, w, h = restored_hr.shape
-                dist = F.interpolate(
-                    restored_hr2, [w, h], mode="bilinear", align_corners=False
-                )
-                rev_dist = revealNet(dist, scale)
-
-            loss_hr = loss_fn[1](restored_hr, lr_1_2)
-            loss_hr_2 = loss_fn[1](restored_hr2, hr)
-            loss_sec = torch.tensor(0.0, device=hr.device)
-            loss_sec_2 = torch.tensor(0.0, device=hr.device)
-
-            if lambda_freq != 0.0:
-                ll_stego_1 = dwt(restored_hr).narrow(1, 0, restored_hr.shape[1])
-                ll_cover_1 = dwt(lr_1_2).narrow(1, 0, lr_1_2.shape[1])
-                l_freq_1 = torch.nn.functional.l1_loss(ll_stego_1, ll_cover_1)
-
-                ll_stego_2 = dwt(restored_hr2).narrow(1, 0, restored_hr2.shape[1])
-                ll_cover_2 = dwt(hr).narrow(1, 0, hr.shape[1])
-                l_freq_2 = torch.nn.functional.l1_loss(ll_stego_2, ll_cover_2)
-
-            if lambda_perc != 0.0 and perc_crit is not None:
-                l_perc_1 = perc_crit(restored_hr, lr_1_2)
-                l_perc_2 = perc_crit(restored_hr2, hr)
-
-            loss_dist = torch.tensor(0.0, device=hr.device)
-            loss_rev_dist = torch.tensor(0.0, device=hr.device)
-
-            loss_stage_1 = loss_hr + (
-                lambda_freq * l_freq_1 if isinstance(l_freq_1, torch.Tensor) else 0.0
-            ) + (lambda_perc * l_perc_1 if isinstance(l_perc_1, torch.Tensor) else 0.0)
-            loss_stage_2 = loss_hr_2 + (
-                lambda_freq * l_freq_2 if isinstance(l_freq_2, torch.Tensor) else 0.0
-            ) + (lambda_perc * l_perc_2 if isinstance(l_perc_2, torch.Tensor) else 0.0)
-
-            loss = loss_stage_1 + loss_stage_2
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-        elif train_stage == "hide_reveal":
-            # Phase 2: train IH + reveal, but keep IM disabled (x_imp = 0).
+        if train_stage == "hide_reveal":
+            # 阶段1：联合训练 SR/IH 与嵌入解密网络，但关闭 IM（x_imp = 0）。
             for p in model.parameters():
                 p.requires_grad = True
             for p in revealNet.parameters():
@@ -627,7 +526,7 @@ def train(
             optimizer.step()
 
         else:
-            # Phase 4: joint end-to-end training with IH + IM + reveal.
+            # 阶段2：joint end-to-end training with IH + IM + reveal.
             for p in model.parameters():
                 p.requires_grad = True
             for p in revealNet.parameters():
@@ -726,17 +625,10 @@ def train(
             current_lr = poly_learning_rate(
                 cfg.base_lr, current_iter, max_iter, power=cfg.power
             )
-            if train_stage == "imp_warmup":
-                for param_group in optimizer_imp.param_groups:
-                    param_group["lr"] = current_lr
-            else:
-                for param_group in optimizer.param_groups:
-                    param_group["lr"] = current_lr
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = current_lr
         else:
-            if train_stage == "imp_warmup":
-                current_lr = optimizer_imp.param_groups[0]["lr"]
-            else:
-                current_lr = optimizer.param_groups[0]["lr"]
+            current_lr = optimizer.param_groups[0]["lr"]
 
         with torch.no_grad():
             batch_enc_psnr = abs(kornia.losses.psnr_loss(restored_hr, lr_1_2, 1))
@@ -1055,4 +947,3 @@ def validate(val_loader, model, revealNet, revealNet_2, imp_net, loss_fn, epoch:
 
 if __name__ == "__main__":
     main()
-

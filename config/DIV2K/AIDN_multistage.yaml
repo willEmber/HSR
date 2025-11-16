@@ -77,15 +77,22 @@ TRAIN:
   evaluate: True # evaluate on validation set, extra gpu memory needed and small batch_size_val is recommend
   eval_freq: 20
   # 多阶段训练参数（供 main/train_multistage.py 使用，数值可自行调整）
-  # 建议从较短阶段开始，再根据效果微调：
-  #   阶段1：仅SR/可逆主干，让主干先学好重建
-  #   阶段2：隐写+解密（IM 关闭）
-  #   阶段3：仅训练IM，拟合 (x_stego_(t−1) − x_cover)
-  #   其余轮次：全局 end-to-end 训练
-  sr_pretrain_epochs: 80    # 阶段1
-  hide_pretrain_epochs: 80  # 阶段2
-  im_warmup_epochs: 20      # 阶段3
-  warmup_imp_epochs: 0      # 与旧脚本兼容，使用本配置时保持为0
+  # 两阶段训练（新版 train_multistage.py）：
+  #   阶段1：train_stage = "hide_reveal"
+  #          联合训练 SR/IH 与嵌入解密网络，但关闭 IM（x_imp=0）
+  #   阶段2：train_stage = "full"
+  #          端到端训练 IH + IM + reveal
+  #
+  # 前多少个 epoch 不启用 IM 有两种写法：
+  #   1）显式设置 im_start_epoch（推荐）；
+  #   2）使用 sr_pretrain_epochs + hide_pretrain_epochs 之和。
+  #
+  # 下面给一组保守默认值，你可以根据训练曲线自行再调大/调小。
+  sr_pretrain_epochs: 0     # 不再单独做 SR-only 阶段
+  hide_pretrain_epochs: 160 # 前 160 个 epoch 关闭 IM，联合训练 IH+reveal
+  im_start_epoch: 160       # 等价于上面两个和，可以直接改这个数
+  im_warmup_epochs: 0       # 已不再使用，保持为 0
+  warmup_imp_epochs: 0      # 仅供旧脚本兼容，保持为0
 
 Distributed:
   dist_url: tcp://127.0.0.1:6799
